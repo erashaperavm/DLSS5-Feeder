@@ -63,7 +63,7 @@ static void FeedOnVkDeviceGeneration();
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 #include "feed_opti.h"      // OptiScaler DLSS-NR: only the file scan and the ini reader are used here (it lives in host64 too)
 
-#define FEED_VERSION "1.16.0-beta.7"
+#define FEED_VERSION "1.17.0-beta.3"
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
 #endif
@@ -362,10 +362,30 @@ struct Cfg
                            // its device refuses one (a feature-level 10.x game, issue #33/#43). 1 = always
                            // let the host create it, which is the only way to exercise that path on a device
                            // that does not need it. Parse-only, not written back, not on the overlay.
+    int   wine_fence_import; // Vulkan client under Wine/Proton: 0 = do not import the helper's D3D12 fences.
+                           // Wine 11 cannot import a D3D12 fence created in ANOTHER process (win32u prints
+                           // "fixme: d3d12 fence from other process") and then faults inside the Unix call,
+                           // which takes the game with it (#121, FF8 Remastered through Zink). The 32-bit
+                           // add-on's fences always come from host64, so under Wine it stops cleanly instead.
+                           // 1 = try anyway, for a Wine build that has closed that gap. Parse-only.
+    int   settle_evals;    // experimentHold: extra evaluates of the SAME frame the host runs after the
+                           // real one, zero motion, no reset, 0..8 -- so every neural pass's history
+                           // settles before the output comes home. Sent per frame (IPC v11). Same key
+                           // and meaning as the 64-bit add-on's; costs (N+1)x the neural stack.
+    int   hold_input;      // experimentHold diagnostic: 1 = the host freezes the colour and depth it hands
+                           // the model (FEED_FRAME_HOLD_INPUT) until this drops. In memory only: the
+                           // overlay toggles it and CfgSave never writes it, so a launch never starts held.
+    float hold_strength;   // experimentHold: the output stabiliser the host runs after the evaluate
+                           // (feed_hold12.h). 0 = off. Where the game's frame did not change, the shown
+                           // pixel keeps this much of last frame's value and takes (1 - this) of the
+                           // model's new answer; where it changed, the model's answer shows as is.
+    float hold_tolerance;  // relative input change (0.04 = 4 percent of local brightness) below which a
+                           // pixel counts as still; the gate opens fully at twice this.
 };
 
-//                                        host_window --v  v-- host_gpu_priority (off)
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0 };
+//                                        host_window --v  v-- host_gpu_priority (off)          settle_evals --v  v-- hold_input
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 0, 100, 0, 1, 0, 0, 0, 0,
+                     /* hold_strength */ 0.0f, /* hold_tolerance */ 0.04f };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -432,11 +452,11 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\nsettle_evals=%d\nhold_strength=%.3f\nhold_tolerance=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
-            g_cfg.cast_mode, g_cfg.cast_anchor);
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
     fclose(f);
 }
 
@@ -447,6 +467,7 @@ static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
     "host_window", "host_gpu_priority", "work_resolution", "work_upscale", "work_sharpness", "async_home",
     "mv_scale_x", "mv_scale_y", "cast_key", "cast_mods", "cast_scale", "cast_mode", "cast_anchor",
+    "settle_evals", "hold_strength", "hold_tolerance",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -492,11 +513,11 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
+               "host_window=%d\nhost_gpu_priority=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_mods=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\nsettle_evals=%d\nhold_strength=%.3f\nhold_tolerance=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
-            g_cfg.cast_mode, g_cfg.cast_anchor);
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.settle_evals, g_cfg.hold_strength, g_cfg.hold_tolerance);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -569,6 +590,10 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
         else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "wine_fence_import") == 0) next.wine_fence_import = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "settle_evals")   == 0) next.settle_evals   = iv < 0 ? 0 : iv > 8 ? 8 : iv;
+        else if (_stricmp(key, "hold_strength")  == 0) next.hold_strength  = val < 0.0f ? 0.0f : val > 1.0f ? 1.0f : val;
+        else if (_stricmp(key, "hold_tolerance") == 0) next.hold_tolerance = val < 0.005f ? 0.005f : val > 0.5f ? 0.5f : val;
     }
     fclose(f);
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
@@ -586,11 +611,12 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d host_gpu_priority=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_mods=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d wine_fence_import=%d settle_evals=%d hold=%.2f/%.3f",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.host_gpu_priority, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_mods, g_cfg.cast_scale,
-            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates, g_cfg.wine_fence_import, g_cfg.settle_evals,
+            g_cfg.hold_strength, g_cfg.hold_tolerance);
     }
     return rebuild;
 }
@@ -2287,7 +2313,8 @@ static void DetectChickenHost()
 // headline keys read-only from host64\OptiScaler.ini, and points at OptiScaler's own menu
 // (Insert, in the host window -- reachable through the in-game cast).
 static bool   g_opti_host            = false;
-static bool   g_opti_host_nr         = false;   // the DLSS-NR fork, not upstream OptiScaler
+static bool   g_opti_host_nr         = false;   // a DLSS-NR fork, not upstream OptiScaler
+static bool   g_opti_host_direct     = false;   // ... the direct-runtime generation (no forwarder; see feed_opti.h)
 static char   g_opti_host_module[64] = "";
 static char   g_opti_ini_path[MAX_PATH];
 static UINT64 g_opti_ini_read_at     = 0;
@@ -2309,10 +2336,9 @@ static void DetectOptiHost()
         char path[MAX_PATH];
         sprintf_s(path, "%s%s", h64, name);
         if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
-        const bool fork = OptiFileHasLiteral(path, OPTI_FORWARDER);
-        if (!fork && !OptiFileHasLiteral(path, OPTI_INI)) continue;
-        g_opti_host        = true;
-        g_opti_host_nr     = fork;
+        if (!OptiIsBuild(path)) continue;
+        g_opti_host = true;
+        OptiClassify(path, &g_opti_host_nr, &g_opti_host_direct);
         strcpy_s(g_opti_host_module, name);
         break;
     }
@@ -2327,12 +2353,12 @@ static void DetectOptiHost()
 
     if (!g_opti_host) { Log("[feed32] OptiScaler: not present in host64\\"); return; }
     if (!g_opti_host_nr)
-        Warn("host64\\%s is OptiScaler, but not the DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
-             "neural pass ever runs. Use the Dagherbou/OptiScaler_DLSSNR build.", g_opti_host_module);
+        Warn("host64\\%s is OptiScaler, but not a DLSS-NR fork: the host's NGX calls go to it, it upscales, and no "
+             "neural pass ever runs. Use a DLSS-NR build (" OPTI_FORKS ").", g_opti_host_module);
     else
-        Log("[feed32] %s: present in host64\\ as %s -- it is the neural consumer; the host's NGX calls are answered by "
-            "it, and its menu is on Insert in the host window (through the in-game cast, or with host_window=1)",
-            OPTI_LABEL, g_opti_host_module);
+        Log("[feed32] %s: present in host64\\ as %s (%s) -- it is the neural consumer; the host's NGX calls are "
+            "answered by it, and its menu is on Insert in the host window (through the in-game cast, or with "
+            "host_window=1)", OPTI_LABEL, g_opti_host_module, OptiFlavour(g_opti_host_direct));
 
     // One consumer, and this side can at least see the files. The host says the rest.
     char reno[MAX_PATH];
@@ -3988,24 +4014,6 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         Log("[feed32] the host created the Output as %s, not the requested %s",
             FeedFmtName(g.output_fmt), FeedFmtName(requested));
 
-    // The fences are per session, not per build: import them once.
-    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
-    {
-        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
-        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
-        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
-        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
-        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
-            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
-            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
-        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
-        { FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
-                      "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)"); return false; }
-        // Hand them back to ReShade as api::fence handles, which is what they already are.
-        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
-        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
-    }
-
     static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
                                                   DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
     for (int i = 0; i < FEED_SLOTS; ++i)
@@ -4028,6 +4036,47 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
             ReleaseShared();
             return false;
         }
+    }
+
+    // The fences are per session, not per build: import them once. AFTER the textures (#121): under
+    // Wine the fence import is the call that takes the game down, so the textures go first and the
+    // log records whether the memory half of the interop crosses processes before anything else.
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
+        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
+        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
+        if (const char *wine = FeedGlWineVersion())
+        {
+            Log("[feed32] running under Wine %s: all %d shared textures from host64 imported as VkImage; the two "
+                "D3D12 fences come from host64 too, and Wine 11's win32u cannot import a fence made in another "
+                "process -- it prints \"fixme: d3d12 fence from other process\" and faults inside the Unix call, "
+                "which ends the game (#121)", wine, FEED_SLOTS);
+            if (!g_cfg.wine_fence_import)
+            {
+                Log("[feed32] not importing them (wine_fence_import=0). wine_fence_import=1 in dlss5-feed.cfg tries "
+                    "anyway, for a Wine build that has closed that gap -- expect the game to close if it has not");
+                ReleaseShared();
+                FeedDisable("Wine/Proton cannot import a D3D12 fence from the host64 helper into this 32-bit Vulkan "
+                            "game (#121; see dlss5-feed.log). The game renders normally.");
+                return false;
+            }
+            Log("[feed32] wine_fence_import=1: importing them anyway");
+        }
+        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
+            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
+        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+        {
+            ReleaseShared();
+            FeedDisable("cross-process fence import failed -- most often the host opened a different GPU than "
+                        "the game (multi-GPU machine, #100): force both onto the same adapter (see dlss5-feed.log)");
+            return false;
+        }
+        // Hand them back to ReShade as api::fence handles, which is what they already are.
+        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
+        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
     }
 
     CastImportPanelVk(ack);   // v7: the host-created panel texture, if the host has one
@@ -4479,7 +4528,10 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
                 FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, async_home ? 4 : 3);   // includes the glFlush the host's wait needs
             }
 
-            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset), 0.0f, 0.0f,
+                                      static_cast<uint32_t>(g_cfg.settle_evals),
+                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      g_cfg.hold_strength, g_cfg.hold_tolerance };
             if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
             else if (async_home)
@@ -4759,7 +4811,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.rs_queue->flush_immediate_command_list();
             g.rs_queue->signal(g.rs_fence_in, n);
 
-            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset), 0.0f, 0.0f,
+                                      static_cast<uint32_t>(g_cfg.settle_evals),
+                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      g_cfg.hold_strength, g_cfg.hold_tolerance };
             bool delivered = false;
             if (!PipeWriteFrame(fm))
                 HostLost("frame message failed");
@@ -5050,7 +5105,10 @@ static void FeedFrame10(reshade::api::effect_runtime *rt, reshade::api::resource
             ctx->Flush();
 
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
-                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f };
+                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
+                                      static_cast<uint32_t>(g_cfg.settle_evals),
+                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      g_cfg.hold_strength, g_cfg.hold_tolerance };
             const bool sent = PipeWriteFrame(fm);
             if (sent && g.sr_active) ++g.jitter_index;
             if (!sent)
@@ -5261,7 +5319,10 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
             // Jitter sign: the shift was applied to the sampling grid, so a sample sits at
             // pixel centre + jitter -- the convention the SDK's jitter offset describes.
             const FeedFrameMsg fm = { n, static_cast<uint32_t>(reset),
-                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f };
+                                      g.sr_active ? g.jitter_x : 0.0f, g.sr_active ? g.jitter_y : 0.0f,
+                                      static_cast<uint32_t>(g_cfg.settle_evals),
+                                      g_cfg.hold_input ? FEED_FRAME_HOLD_INPUT : 0u,
+                                      g_cfg.hold_strength, g_cfg.hold_tolerance };
             const bool sent = PipeWriteFrame(fm);
             if (sent && g.sr_active) ++g.jitter_index;
             if (!sent)
@@ -5886,6 +5947,34 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "Costs one frame of latency on the DLSS output; the temporal history hides it. "
                                   "Turn it off to get the original same-frame behaviour back.");
     if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
+    if (ImGui::SliderInt("Settle evaluates (extra, per frame)", &g_cfg.settle_evals, 0, 8)) dirty = true;
+    ImGui::SameLine(); HelpMarker("Experimental. After the real evaluate, the helper runs the same frame N more times "
+                                  "with zero motion and no reset before the result comes home. Every neural pass "
+                                  "keeps a history that takes a few frames to settle on a new framing, and each "
+                                  "extra evaluate advances it one step without the scene moving -- so the image "
+                                  "settles sooner after the camera stops. Costs (N+1)x the whole neural stack "
+                                  "every frame. Meant for OptiScaler DLSS-NR; applies on the next frame.");
+    ImGui::Separator();
+    ImGui::TextUnformatted("Output stabiliser");
+    if (ImGui::SliderFloat("Hold strength", &g_cfg.hold_strength, 0.0f, 1.0f)) dirty = true;
+    ImGui::SameLine(); HelpMarker("Experimental. Where the game's frame did not change since the last one, the "
+                                  "shown pixel keeps this much of what was shown last frame and takes the rest "
+                                  "from the model; where the frame changed, the model's answer shows as is. "
+                                  "0 = off. 1 = a still region never moves until something in it really "
+                                  "changes. 0.9 = the model's new opinion fades in over ~10 frames. "
+                                  "Runs on the helper after the evaluate; costs one compute pass.");
+    if (ImGui::SliderFloat("Change tolerance", &g_cfg.hold_tolerance, 0.005f, 0.3f, "%.3f")) dirty = true;
+    ImGui::SameLine(); HelpMarker("How much a pixel's input (3x3 box, relative to its brightness) may differ "
+                                  "from last frame and still count as still. Below it: held. At twice it: "
+                                  "the model shows through fully. Raise it if a held region unlocks by itself "
+                                  "(exposure drift, shimmer); lower it if slow animation lags behind.");
+    bool hold_input = g_cfg.hold_input != 0;
+    if (ImGui::Checkbox("Hold input (diagnostic)", &hold_input)) g_cfg.hold_input = hold_input ? 1 : 0;   // never saved
+    ImGui::SameLine(); HelpMarker("Freezes the colour and depth the helper hands the model, with zero motion, "
+                                  "from the frame this is ticked until it is unticked. The game keeps rendering; "
+                                  "only the model's input is frozen. If the picture still drifts while held, the "
+                                  "drift is the consumer's own; if it is rock steady, the game's frame keeps "
+                                  "changing after the camera stops and the model amplifies it.");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 

@@ -47,7 +47,7 @@
 
 .PARAMETER Consumer
     Which neural consumer does the DLSS 5 work: RenoDX (Krish's renodx-dlss5 add-on),
-    DFC (Deep Fried Chicken) or OptiScaler (the OptiScaler_DLSSNR fork, installed as
+    DFC (Deep Fried Chicken) or OptiScaler (an OptiScaler DLSS-NR fork, installed as
     winmm.dll beside ReShade and set up to run its neural pass on the feed).
 
     RenoDX and OptiScaler are downloaded automatically. Deep Fried Chicken is NOT: its
@@ -57,6 +57,12 @@
 
     Omitted, the script asks at the start; with -Yes and no choice given it takes RenoDX,
     which is the only one it can fetch unattended.
+
+.PARAMETER OptiScalerFork
+    With -Consumer OptiScaler: which DLSS-NR fork. wilsjo2 (OptiScaler-DLSSNR-PreSR-Multipass:
+    actively maintained, no forwarder DLL, pre-SR and multipass options) or Dagherbou
+    (OptiScaler_DLSSNR, the original; ships nvngx.dll_dlssnr.dll, its forwarder). Both are
+    supported by the feeder. Omitted, the script asks; with -Yes it takes wilsjo2.
 
 .PARAMETER MvProvider
     DLSS5_MV_PROVIDER value: 3 (LumeniteFX Kernel, default) or 4 (LumeniteFX QuantMotion).
@@ -69,7 +75,7 @@
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
     ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
-    renodx-dlss5*.addon64, OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
+    renodx-dlss5*.addon64, OptiScaler-NR-*.zip / OptiScaler-DLSSNR*.zip, LumeniteFX*.zip, dgVoodoo2_*.zip,
     ReShade.fxh, ReShadeUI.fxh, DrawText.fxh. The NGX runtimes and the RenoDX add-on are
     also accepted as the .zip they are published in.
 
@@ -126,6 +132,9 @@ param(
     [ValidateSet('Ask', 'DFC', 'RenoDX', 'OptiScaler')]
     [string] $Consumer = 'Ask',
 
+    [ValidateSet('Ask', 'wilsjo2', 'Dagherbou')]
+    [string] $OptiScalerFork = 'Ask',
+
     [ValidateSet(3, 4)]
     [int] $MvProvider = 3,
 
@@ -180,11 +189,25 @@ $Sources = @{
     Lumenite        = 'https://codeload.github.com/umar-afzaal/LumeniteFX/zip/refs/heads/mainline'
     DgVoodoo        = 'https://api.github.com/repos/dege-diosg/dgVoodoo2/releases/latest'
     # No public download; see Get-ChickenManually.
-    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.0/nvngx_dlssnr_310.8.0.zip'
+    # The neural model and the RenoDX add-on track RHI's newest release of each (Get-RhiLatest);
+    # these two pins are only the fallback when GitHub's API cannot be reached and nothing is cached.
+    # Lecram is a modified 310.8 build, RTX 50 only like NVIDIA's signed 310.8.0 (#131): older
+    # GPUs need a build from the RenoDX Discord, which Verify-DLSS5Feeder.ps1 says at the end.
+    # RenoDX before v6 fails on driver 616.64+.
+    RhiReleases     = 'https://api.github.com/repos/RankFTW/rhi-repo/releases?per_page=100'
+    DlssNrTag       = '^dlssnr-'
+    RenoDxDlss5Tag  = '^renodx-dlss5-\d'
+    DlssNr          = 'https://github.com/RankFTW/rhi-repo/releases/download/dlssnr-310.8.Lecram/nvngx_dlssnr_310.8.Lecram.zip'
     Dlss            = 'https://github.com/RankFTW/rhi-repo/releases/download/dlss-310.9.1/nvngx_dlss_310.9.1.zip'
-    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-4.70/renodx-dlss5_4.70.zip'
-    OptiScalerReleases = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases'
-    OptiScalerHome     = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases'
+    RenoDxDlss5     = 'https://github.com/RankFTW/rhi-repo/releases/download/renodx-dlss5-7.0.0-rc8/renodx-dlss5_7.0.0-rc8.zip'
+    # Two DLSS-NR forks, both supported; see -OptiScalerFork. Each names its release zip
+    # differently, and wilsjo2 also publishes an RTX 40 MFG variant that the pattern skips.
+    OptiScalerReleases = @{ wilsjo2 = 'https://api.github.com/repos/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            Dagherbou = 'https://api.github.com/repos/Dagherbou/OptiScaler_DLSSNR/releases' }
+    OptiScalerHome     = @{ wilsjo2 = 'https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases'
+                            Dagherbou = 'https://github.com/Dagherbou/OptiScaler_DLSSNR/releases' }
+    OptiScalerAsset    = @{ wilsjo2 = '(?i)^OptiScaler-NR-v[\d.]+\.zip$'; Dagherbou = '(?i)^OptiScaler-DLSSNR-.*\.zip$' }
+    OptiScalerLocal    = @{ wilsjo2 = 'OptiScaler-NR-*.zip'; Dagherbou = 'OptiScaler-DLSSNR*.zip' }
     DfcDiscord      = 'https://discord.gg/g2v2XGqvR'
     RenoDxDiscord   = 'https://discord.com/invite/renodx'
 }
@@ -1061,9 +1084,12 @@ function Get-ChickenManually
 function Resolve-PieceZipped
 {
     param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $DefaultUrl,
-          [string] $CacheName, [string] $InnerName)
+          [string] $CacheName, [string] $InnerName, [string] $InnerCacheName)
 
-    $inner = Join-Safe $script:Cache $InnerName
+    # The extracted file is cached under InnerCacheName when given (one per release, so a newer
+    # release is actually downloaded), else under its own name.
+    if (-not $InnerCacheName) { $InnerCacheName = $InnerName }
+    $inner = Join-Safe $script:Cache $InnerCacheName
     if (-not $Explicit -and (Test-FileHere $inner)) {
         Report -Status 'Ok' -Text ($Label + ': using the copy already in the cache')
         return $inner
@@ -1093,6 +1119,60 @@ function Resolve-PieceZipped
     return $inner
 }
 
+
+# Newest release on RankFTW/rhi-repo whose tag matches $TagPattern and that carries a zip.
+# The repo mixes many projects in one release list, and its order is not by date, so sort.
+# Returns @{ Tag; Url; Name } or $null (GitHub unreachable, rate-limited, nothing matched).
+$script:RhiReleases = $null
+function Get-RhiLatest
+{
+    param([string] $TagPattern, [string] $Label)
+    if ($null -eq $script:RhiReleases) {
+        $script:RhiReleases = @()
+        $json = Get-WebString $Sources.RhiReleases
+        # Windows PowerShell 5.1 hands a JSON array down the pipeline as ONE object; assigning
+        # it first and piping the variable enumerates the releases.
+        if ($json) { try { $parsed = $json | ConvertFrom-Json; $script:RhiReleases = @($parsed | ForEach-Object { $_ }) } catch { } }
+    }
+    $pick = $script:RhiReleases |
+            Where-Object { -not $_.draft -and $_.tag_name -match $TagPattern -and @($_.assets | Where-Object { $_.name -match '(?i)\.zip$' }).Count -gt 0 } |
+            Sort-Object { [DateTime] $_.published_at } -Descending | Select-Object -First 1
+    if (-not $pick) { return $null }
+    $asset = @($pick.assets | Where-Object { $_.name -match '(?i)\.zip$' })[0]
+    Report -Status 'Info' -Text ($Label + ': latest on RHI is ' + $pick.tag_name + ' (' + $asset.name + ')')
+    return @{ Tag = $pick.tag_name; Url = $asset.browser_download_url; Name = $asset.name }
+}
+
+# An RHI piece that follows the newest release: resolves the release, then hands
+# Resolve-PieceZipped per-release cache names. Offline, the newest copy already cached
+# (from any release) wins over the pinned fallback URL.
+function Resolve-RhiPiece
+{
+    param([string] $Label, [string] $Explicit, [string] $LocalPattern, [string] $TagPattern,
+          [string] $FallbackUrl, [string] $InnerName, [string] $ZipPrefix)
+
+    $ext = [IO.Path]::GetExtension($InnerName)
+    $stem = [IO.Path]::GetFileNameWithoutExtension($InnerName)
+    if ($Explicit) {
+        return Resolve-PieceZipped -Label $Label -Explicit $Explicit -CacheName ($stem + '-explicit.zip') -InnerName $InnerName `
+                                   -InnerCacheName ($stem + '-explicit' + $ext)
+    }
+    $rel = Get-RhiLatest -TagPattern $TagPattern -Label $Label
+    if (-not $rel) {
+        $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter ('rhi_' + $ZipPrefix + '*' + $ext) -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($hit -and -not $LocalFiles) {
+            Report -Status 'Warn' -Text ($Label + ': could not get the newest release from RHI; using the cached ' + $hit.Name)
+            return $hit.FullName
+        }
+        $url = $FallbackUrl
+    }
+    else { $url = $rel.Url }
+    $zipName = [IO.Path]::GetFileName(([Uri] $url).AbsolutePath)
+    $innerCache = 'rhi_' + [IO.Path]::GetFileNameWithoutExtension($zipName) + $ext
+    return Resolve-PieceZipped -Label $Label -LocalPattern $LocalPattern -DefaultUrl $url -CacheName $zipName `
+                               -InnerName $InnerName -InnerCacheName $innerCache
+}
 
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -1471,7 +1551,7 @@ if ($Consumer -eq 'Ask') {
         Write-Chunk '   2. Deep Fried Chicken  ' 'Gray' -NoNewline
         Write-Chunk 'negotiates with the feeder over its own interop ABI -- you must fetch it by hand from its Discord' 'DarkGray'
         Write-Chunk '   3. OptiScaler DLSS-NR  ' 'Gray' -NoNewline
-        Write-Chunk 'the OptiScaler_DLSSNR fork: it takes the feed''s DLSS call, upscales, then runs the neural pass (menu on Insert)' 'DarkGray'
+        Write-Chunk 'an OptiScaler fork with the neural pass built in: it takes the feed''s DLSS call, upscales, then runs the pass (menu on Insert)' 'DarkGray'
         Write-Chunk '  Exactly one of them may be installed: each goes inert, or misbehaves, beside the others.' 'DarkGray'
         Write-Chunk '  Which one? [1/2/3, Enter for 1] ' 'Cyan' -NoNewline
         try { $a = Read-Host } catch { $a = '' }
@@ -1485,7 +1565,29 @@ if ($Consumer -eq 'Ask') {
         }
     }
 }
-$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR' } }
+# Which DLSS-NR fork (issue #126). wilsjo2's is the maintained one and needs no forwarder DLL;
+# Dagherbou's is the original the feeder was first measured against. The feeder handles both.
+if ($Consumer -eq 'OptiScaler' -and $OptiScalerFork -eq 'Ask') {
+    if ($Yes) {
+        $OptiScalerFork = 'wilsjo2'
+    }
+    else {
+        Write-Host ''
+        Write-Chunk '  Which OptiScaler DLSS-NR fork?' 'White'
+        Write-Chunk '   1. wilsjo2    ' 'Gray' -NoNewline
+        Write-Chunk 'OptiScaler-DLSSNR-PreSR-Multipass: actively maintained; no forwarder DLL; pre-SR, multipass and finished-picture options' 'DarkGray'
+        Write-Chunk '   2. Dagherbou  ' 'Gray' -NoNewline
+        Write-Chunk 'OptiScaler_DLSSNR: the original fork; ships its nvngx.dll_dlssnr.dll forwarder' 'DarkGray'
+        Write-Chunk '  Which one? [1/2, Enter for 1] ' 'Cyan' -NoNewline
+        try { $a = Read-Host } catch { $a = '' }
+        switch ($a.Trim()) {
+            '2'         { $OptiScalerFork = 'Dagherbou' }
+            'dagherbou' { $OptiScalerFork = 'Dagherbou' }
+            default     { $OptiScalerFork = 'wilsjo2' }
+        }
+    }
+}
+$consumerLabel = switch ($Consumer) { 'DFC' { 'Deep Fried Chicken' } 'RenoDX' { 'RenoDX DLSS 5' } default { 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')' } }
 Write-Chunk '  Neural  ' 'DarkGray' -NoNewline
 Write-Host $consumerLabel
 if ($LocalFiles) {
@@ -1846,57 +1948,61 @@ if ($Consumer -eq 'DFC') {
     }
 }
 elseif ($Consumer -eq 'RenoDX') {
-    $renoPath = Resolve-PieceZipped -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
-                                    -LocalPattern 'renodx-dlss5*' -DefaultUrl $Sources.RenoDxDlss5 `
-                                    -CacheName 'renodx-dlss5.zip' -InnerName 'renodx-dlss5.addon64'
+    $renoPath = Resolve-RhiPiece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon `
+                                 -LocalPattern 'renodx-dlss5*' -TagPattern $Sources.RenoDxDlss5Tag -FallbackUrl $Sources.RenoDxDlss5 `
+                                 -InnerName 'renodx-dlss5.addon64' -ZipPrefix 'renodx-dlss5_'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
                -Detail ('Get it from the RenoDX Discord (' + $Sources.RenoDxDiscord + ') or the RHI installer, and pass it with -RenoDxAddon or via -LocalFiles.')
     }
 }
 else {
-    # OptiScaler_DLSSNR ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in it).
-    # Newest asset, the way the feeder's own release is found above; offline, the newest cached copy.
+    # Each fork ships as a GitHub release (about 130 MB; nvngx_dlssnr.dll is not in either).
+    # Newest release the maintainer marks as such (or the newest of all with -Prerelease, the
+    # way the feeder's own release is found above); offline, the newest cached copy.
+    $optiLabel = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ')'
+    $optiLocal = $Sources.OptiScalerLocal[$OptiScalerFork]
     if ($OptiScalerZip) {
-        $optiPath = Resolve-Piece -Label 'OptiScaler DLSS-NR' -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
+        $optiPath = Resolve-Piece -Label $optiLabel -Explicit $OptiScalerZip -CacheName 'OptiScaler-DLSSNR-explicit.zip'
     }
     else {
         if ($LocalFiles) {
-            $hit = Get-ChildItem -LiteralPath $LocalFiles -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-            if ($hit) { $optiPath = $hit.FullName; Report -Status 'Ok' -Text ('OptiScaler DLSS-NR: using ' + $optiPath) }
+            $hit = Get-ChildItem -LiteralPath $LocalFiles -File -Filter $optiLocal -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($hit) { $optiPath = $hit.FullName; Report -Status 'Ok' -Text ($optiLabel + ': using ' + $optiPath) }
         }
         if (-not $optiPath) {
-            $relJson = Get-WebString ($Sources.OptiScalerReleases + '/latest')
+            $relJson = Get-WebString ($Sources.OptiScalerReleases[$OptiScalerFork] + $(if ($Prerelease) { '?per_page=5' } else { '/latest' }))
             $assetUrl = $null
             $assetName = $null
             if ($relJson) {
                 try {
                     $rel = $relJson | ConvertFrom-Json
+                    if ($Prerelease) { $rel = @($rel)[0] }
                     foreach ($a in @($rel.assets)) {
-                        if ($a.name -match '(?i)^OptiScaler-DLSSNR-.*\.zip$') { $assetUrl = $a.browser_download_url; $assetName = $a.name; break }
+                        if ($a.name -match $Sources.OptiScalerAsset[$OptiScalerFork]) { $assetUrl = $a.browser_download_url; $assetName = $a.name; break }
                     }
-                    if ($assetUrl) { Report -Status 'Info' -Text ('OptiScaler DLSS-NR latest release: ' + $rel.tag_name + ' (' + $assetName + ')') }
+                    if ($assetUrl) { Report -Status 'Info' -Text ($optiLabel + ' release: ' + $rel.tag_name + ' (' + $assetName + ')') }
                 }
                 catch { }
             }
             if ($assetUrl) {
                 $dest = Join-Safe $script:Cache $assetName
-                if (Get-Download -Url $assetUrl -Dest $dest -Label 'OptiScaler DLSS-NR') { $optiPath = $dest }
+                if (Get-Download -Url $assetUrl -Dest $dest -Label $optiLabel) { $optiPath = $dest }
             }
             else {
-                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter 'OptiScaler-DLSSNR*.zip' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+                $hit = Get-ChildItem -LiteralPath $script:Cache -File -Filter $optiLocal -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
                 if ($hit) { $optiPath = $hit.FullName; Report -Status 'Warn' -Text ('GitHub unreachable; using the cached OptiScaler release ' + $hit.Name) }
             }
         }
     }
     if (-not $optiPath) {
-        Report -Status 'Fail' -Text 'OptiScaler DLSS-NR is not available.' `
-               -Detail ('Download OptiScaler-DLSSNR-<version>.zip from ' + $Sources.OptiScalerHome + ' and pass it with -OptiScalerZip, or drop it in -LocalFiles.')
+        Report -Status 'Fail' -Text ($optiLabel + ' is not available.') `
+               -Detail ('Download the release zip (' + $optiLocal + ') from ' + $Sources.OptiScalerHome[$OptiScalerFork] + ' and pass it with -OptiScalerZip, or drop it in -LocalFiles.')
     }
 }
 
 # 3f. NVIDIA runtimes
-$dlssNrPath = Resolve-PieceZipped -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -DefaultUrl $Sources.DlssNr -CacheName 'nvngx_dlssnr.zip' -InnerName 'nvngx_dlssnr.dll'
+$dlssNrPath = Resolve-RhiPiece    -Label 'nvngx_dlssnr.dll' -Explicit $DlssNrDll -LocalPattern 'nvngx_dlssnr*' -TagPattern $Sources.DlssNrTag -FallbackUrl $Sources.DlssNr -InnerName 'nvngx_dlssnr.dll' -ZipPrefix 'nvngx_dlssnr_'
 $dlssPath   = Resolve-PieceZipped -Label 'nvngx_dlss.dll'   -Explicit $DlssDll   -LocalPattern 'nvngx_dlss.dll'   -DefaultUrl $Sources.Dlss   -CacheName 'nvngx_dlss.zip'   -InnerName 'nvngx_dlss.dll'
 if (-not $dlssNrPath) { Report -Status 'Fail' -Text 'nvngx_dlssnr.dll is not available.' -Detail ('It is on the RenoDX Discord (' + $Sources.RenoDxDiscord + '). Pass it with -DlssNrDll.') }
 if (-not $dlssPath)   { Report -Status 'Fail' -Text 'nvngx_dlss.dll is not available.'   -Detail 'Any DLSS-enabled game ships one, or use DLSS Swapper. Pass it with -DlssDll.' }
@@ -2553,9 +2659,11 @@ else {
             if ($imports.Count -eq 0 -and -not $is32) { Report -Status 'Info' -Text ('Could not read the game''s imports; OptiScaler goes in as ' + $optiName + '. If OptiScaler.log never appears, rename it to a DLL the game does load.') }
             try {
                 $z = Open-Zip $optiPath
+                $zipForwarder = $false   # Dagherbou's generation ships nvngx.dll_dlssnr.dll; wilsjo2 v0.8.1+ has no such file
                 try {
                     $entries = @($z.Entries | Where-Object { $_.FullName -notmatch '[\\/]$' -and $_.Length -gt 0 })
                     if (-not ($entries | Where-Object { $_.FullName -match '(?i)(^|[\\/])OptiScaler\.dll$' })) { throw 'OptiScaler.dll not found in the zip' }
+                    if ($entries | Where-Object { $_.FullName -match '(?i)^nvngx\.dll_dlssnr\.dll$' }) { $zipForwarder = $true }
                     $iniKept = $false
                     foreach ($e in $entries) {
                         $rel = $e.FullName -replace '/', '\'
@@ -2565,6 +2673,7 @@ else {
                             if ((Test-FileHere (Join-Safe $consumerDir 'OptiScaler.ini')) -and -not $Force) { $iniKept = $true; continue }
                         }
                         elseif ($rel -match '(?i)^(setup_windows\.bat|setup_linux\.sh|!! .*)$') { continue }   # OptiScaler's own installer; this script does its job
+                        elseif ($rel -match '(?i)^(docs|images|tests)\\') { continue }   # wilsjo2 ships its documentation tree in the zip; not for a game folder
                         Expand-ZipEntry -Entry $e -To (Join-Safe $consumerDir $rel)
                     }
                 }
@@ -2572,25 +2681,34 @@ else {
                 Start-Sleep -Milliseconds 1000
                 $dll = Join-Safe $consumerDir $optiName
                 if (-not (Test-FileHere $dll)) { throw ($optiName + ' vanished right after extraction -- Defender? Check Windows Security > Protection history.') }
-                $t = 'OptiScaler DLSS-NR installed as ' + $optiName
+                $t = 'OptiScaler DLSS-NR (' + $OptiScalerFork + ') installed as ' + $optiName
                 if ($iniKept) { $t += ' (existing OptiScaler.ini kept)' }
-                Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it')
+                $beside = if ($zipForwarder) { 'the neural forwarder nvngx.dll_dlssnr.dll and the OptiScaler\ runtime folder beside it' }
+                          else { 'the OptiScaler\ runtime folder beside it; this build needs no forwarder DLL (feature 18 goes through the driver''s NGX core)' }
+                Report -Status 'Done' -Text ($t + '.') -Detail ('in ' + $consumerWhere + '; ' + $beside)
+                if (-not $zipForwarder) {
+                    # Left over from the other generation: nothing loads it, and the fork's own install
+                    # notes say to remove it on upgrade.
+                    Disable-Conflict -Path (Find-FileIn $consumerDir 'nvngx.dll_dlssnr.dll') -Why 'the forwarder DLL of the Dagherbou-generation build; this build never loads it, and its install notes say to remove it when upgrading'
+                }
 
-                # The keys a bare NGX client needs. [DlssNr] Enabled is off in every release (the fork
-                # refuses to ship it on); the exposure scan hooks resource creation on the feeder's
-                # device for a buffer the feed never offers; the spoofs are for non-NVIDIA GPUs. A key
-                # the user has already set by hand (anything but "auto") is left alone.
+                # The keys a bare NGX client needs. [DlssNr] Enabled is off in every release (both
+                # forks refuse to ship it on); the exposure scan (forwarder build only -- the other
+                # deletes the key on save) hooks resource creation on the feeder's device for a buffer
+                # the feed never offers; the spoofs are for non-NVIDIA GPUs. A key the user has already
+                # set by hand (anything but "auto") is left alone.
                 $ini = Join-Safe $consumerDir 'OptiScaler.ini'
                 if (Test-FileHere $ini) {
                     $text = [IO.File]::ReadAllText($ini)
                     $wanted = @(
-                        @('DlssNr', 'Enabled', 'true'), @('DlssNr', 'ScanExposure', 'false'),
+                        @('DlssNr', 'Enabled', 'true'),
                         @('Upscalers', 'Dx12Upscaler', 'dlss'),
                         @('Log', 'LogToFile', 'true'), @('Log', 'LogLevel', '2'),
                         @('Spoofing', 'Dxgi', 'false'), @('Spoofing', 'StreamlineSpoofing', 'false'),
                         @('Inputs', 'EnableXeSSInputs', 'false'), @('Inputs', 'EnableFsr2Inputs', 'false'),
                         @('Inputs', 'EnableFsr3Inputs', 'false'), @('Inputs', 'EnableFfxInputs', 'false'),
                         @('Hotfix', 'CheckForUpdate', 'false'))
+                    if ($zipForwarder) { $wanted += , @('DlssNr', 'ScanExposure', 'false') }
                     $kept = @()
                     foreach ($kv in $wanted) {
                         $cur = Get-IniKey -Text $text -Section $kv[0] -Key $kv[1]
@@ -2601,7 +2719,7 @@ else {
                     $null = $script:Changed.Add($ini)
                     $d = 'Keys you had set by hand are left alone'
                     if ($kept.Count -gt 0) { $d += ': ' + ($kept -join ', ') }
-                    Report -Status 'Done' -Text 'OptiScaler.ini set up for the feed: [DlssNr] Enabled=true, ScanExposure=false, Dx12Upscaler=dlss, logging on, spoofing off.' -Detail ($d + '.')
+                    Report -Status 'Done' -Text ('OptiScaler.ini set up for the feed: [DlssNr] Enabled=true, ' + $(if ($zipForwarder) { 'ScanExposure=false, ' } else { '' }) + 'Dx12Upscaler=dlss, logging on, spoofing off.') -Detail ($d + '.')
                     if ($kept | Where-Object { $_ -match '(?i)^\[DlssNr\] Enabled=' }) {
                         Report -Status 'Warn' -Text 'OptiScaler.ini has [DlssNr] Enabled set to something other than true -- the neural pass is off until you turn it on in OptiScaler''s menu (Insert).'
                     }
@@ -2847,9 +2965,9 @@ elseif ($Consumer -eq 'RenoDX') {
     $steps += 'Turn on neural rendering in the DLSS 5 Neural Rendering add-on panel.'
 }
 else {
-    if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. "DLSS Neural Rendering" is its last section; the pass is already switched on.' }
-    else { $steps += 'Press Insert for OptiScaler''s menu; "DLSS Neural Rendering" is its last section, and the pass is already switched on.' }
-    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frame, "neural model (feature 18) loaded".'
+    if ($is32) { $steps += 'OptiScaler''s menu lives in the host64 helper: open the ReShade overlay > Add-ons > DLSS 5 Feed, press "Show the DLSS 5 panel in-game", then press Insert. Its neural-rendering section holds the pass controls; the pass is already switched on.' }
+    else { $steps += 'Press Insert for OptiScaler''s menu; its neural-rendering section holds the pass controls, and the pass is already switched on.' }
+    $steps += 'dlss5-feed.log (host64\dlss5-feed-host.log for a 32-bit game) should say "NGX calls are routed through OptiScaler DLSS-NR" and, after the first frames, "neural model (feature 18) loaded".'
 }
 $steps += 'Turn the game''s MSAA/SSAA off.'
 if ($isDgV -and -not $DgVoodooWatermark) { $steps += 'dgVoodoo''s watermark is off. If nothing seems to happen, re-run with -DgVoodooWatermark to confirm dgVoodoo is active at all.' }

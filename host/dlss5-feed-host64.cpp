@@ -23,6 +23,7 @@
 #include <mmsystem.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include <d3dcompiler.h>   // pD3DCompile only; the function itself comes from d3dcompiler_47 by name
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -42,6 +43,7 @@
 #include "../src/feed_fmt.h"
 #include "../src/feed_dfc.h"   // Deep Fried Chicken interop ABI 1 (producer side, HostMode=1 here)
 #include "../src/feed_opti.h"  // OptiScaler DLSS-NR as the consumer: detection and the two fingerprints
+#include "../src/feed_hold12.h" // the output stabiliser (experimentHold): one compute pass after the evaluate
 
 #ifndef FEED_BUILD_ID
 #define FEED_BUILD_ID "unknown"
@@ -316,6 +318,7 @@ static char g_renodx_file[MAX_PATH] = "";
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
 static bool g_renodx_v47  = false;   // DLSS 5 add-on is v4.7+ (reversible colour bridge, workset pool)
+static bool g_renodx_v6   = false;   // v6+: still carries the v4.7 markers, but survives driver 616.64+
 // NVIDIA's branded driver version times 100 (616.64 -> 61664), 0 when it could not be read.
 // A driver number is not usually worth comparing against, but see LogHostAdapter: one
 // specific pairing of driver and neural consumer faults inside the driver every frame.
@@ -372,6 +375,9 @@ static void RenodxFindBanner(const char *buf, DWORD size, char *out, size_t out_
         // rhi-repo's "renodx-dlss5-4.55" tag carries a three-part banner, "v4.1.5" (#90).
         if (end + 1 < size && buf[end] == '.' && digit(buf[end + 1]))
             for (++end; end < size && digit(buf[end]); ++end) {}
+        // Pre-releases add a suffix: "v7.0.0-rc8", "v8.0.1-beta8".
+        if (end + 1 < size && buf[end] == '-' && isalnum(static_cast<unsigned char>(buf[end + 1])))
+            for (++end; end < size && isalnum(static_cast<unsigned char>(buf[end])); ++end) {}
         if (end < size && buf[end] == '\0' && end - i < out_size)
         {
             memcpy(out, buf + i, end - i);
@@ -437,6 +443,7 @@ static void DetectRenodxAddon()
     if (g_renodx_v46) g_renodx_lazy = true;   // v4.6+ is a per-present-rescan engine too
 
     char ver[48] = "?";
+    unsigned built = 0;   // yyyymmdd: the add-on's file version is 0.<year>.<month><day>.<time>
     DWORD dummy = 0;
     const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
     if (vsize > 0)
@@ -446,13 +453,22 @@ static void DetectRenodxAddon()
         UINT flen = 0;
         if (vdata != nullptr && GetFileVersionInfoA(path, 0, vsize, vdata) &&
             VerQueryValueA(vdata, "\\", reinterpret_cast<void **>(&ffi), &flen) && ffi != nullptr)
+        {
             sprintf_s(ver, "%u.%u.%u.%u", HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
                       HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+            built = LOWORD(ffi->dwFileVersionMS) * 10000u + HIWORD(ffi->dwFileVersionLS);
+        }
         free(vdata);
     }
+    // Every generation since v4.7 keeps the v4.7 markers, so the markers alone cannot tell
+    // v4.7 from v8. The banner's major number can; a build with no banner falls back to
+    // its build date (v6.1.0 is 0.2026.917.1432, v4.7 is 0.2026.828.517).
+    const int major = gen[0] == 'v' ? atoi(gen + 1) : 0;
+    g_renodx_v6 = g_renodx_v47 && (major >= 6 || (major == 0 && built >= 20260917u));
     Log("[host] DLSS 5 add-on: %s%s (file version %s) -- %s engine",
         gen[0] != '\0' ? "" : "v", gen[0] != '\0' ? gen : ver, ver,
-        g_renodx_v47  ? "v4.7+ (lazy adoption, colour bridge, workset pool)"
+        g_renodx_v6   ? "v6+ (v4.7 lineage; neural pass measured working on driver 617.14)"
+      : g_renodx_v47  ? "v4.7+ (lazy adoption, colour bridge, workset pool)"
       : g_renodx_v46  ? "v4.6 (lazy adoption, global hotkeys, upscaling latch)"
       : g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
 
@@ -712,18 +728,23 @@ static void ChickenPoll()
 // OptiScaler DLSS-NR beside this exe -- the third neural consumer (see feed_opti.h; mirrors the
 // section in src/dlss5-feed.cpp, keep the two in step). It is a proxy DLL this exe imports
 // (winmm.dll or version.dll), so by the time this runs it is loaded and its nvngx redirect is
-// armed: nothing is loaded from this side. What this does is name it, tell the DLSS-NR fork from
-// upstream OptiScaler, read the ini keys that decide whether the neural pass can run at all, and
-// refuse to be quiet about a second consumer.
+// armed: nothing is loaded from this side. What this does is name it, tell a DLSS-NR fork (either
+// generation, see feed_opti.h) from upstream OptiScaler, read the ini keys that decide whether the
+// neural pass can run at all, and refuse to be quiet about a second consumer.
 static OptiInfo    g_opti;
 static OptiBackend g_opti_backend;
 
 static void DetectOptiScaler()
 {
     g_opti = OptiInfo{};
-    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.dlss_inputs = g_opti.hook_original_only = g_opti.overlay_menu = -1;
+    g_opti.nr_enabled = g_opti.scan_exposure = g_opti.run_before_sr = g_opti.finished_picture = g_opti.dlss_inputs =
+        g_opti.hook_original_only = g_opti.overlay_menu = -1;
     char dir[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    const char *exe_name = strrchr(dir, '\\') != nullptr ? strrchr(dir, '\\') + 1 : dir;
+    char exe_copy[MAX_PATH];
+    strcpy_s(exe_copy, exe_name);
+    exe_name = exe_copy;
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
 
     if (!OptiFindModule(&g_opti))
@@ -736,7 +757,7 @@ static void DetectOptiScaler()
             char path[MAX_PATH];
             sprintf_s(path, "%s%s", dir, name);
             if (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) continue;
-            if (!OptiFileHasLiteral(path, OPTI_FORWARDER) && !OptiFileHasLiteral(path, OPTI_INI)) continue;
+            if (!OptiIsBuild(path)) continue;
             Log("[host] WARNING: %s is an OptiScaler build, but this helper never loads a DLL of that name, so it "
                 "cannot take the NGX calls. Rename it winmm.dll or version.dll (both are imported at start).", path);
             return;
@@ -746,20 +767,23 @@ static void DetectOptiScaler()
     }
 
     g_opti.present = true;
-    g_opti.nr_fork = OptiFileHasLiteral(g_opti.path, OPTI_FORWARDER);
+    OptiClassify(g_opti.path, &g_opti.nr_fork, &g_opti.direct);
     FeedReadFileIdent(g_opti.path, &g_opti.ident);
     OptiReadIni(&g_opti);
-    char ver[400];
+    char ver[400], nrkeys[160];
     FeedFormatFileIdent(g_opti.ident, ver, sizeof(ver));
-    Log("[host] %s loaded as %s (%s); OptiScaler.ini: [DlssNr] Enabled=%s ScanExposure=%s, [Upscalers] Dx12Upscaler=%s, "
-        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s",
+    OptiFormatNrKeys(&g_opti, nrkeys, sizeof(nrkeys));
+    Log("[host] %s loaded as %s (%s): %s; OptiScaler.ini: [DlssNr] Enabled=%s %s, [Upscalers] Dx12Upscaler=%s, "
+        "[Inputs] EnableDlssInputs=%s, [Hooks] HookOriginalNvngxOnly=%s, [ProcessFilter] TargetProcessName=%s",
         g_opti.nr_fork ? OPTI_LABEL : "OptiScaler (upstream build, no neural pass)", g_opti.module, ver,
-        OptiTri(g_opti.nr_enabled, "auto (= false)"), OptiTri(g_opti.scan_exposure, "auto (= false)"), g_opti.upscaler,
-        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"));
+        g_opti.nr_fork ? OptiFlavour(g_opti.direct) : "no DLSS-NR literal in the file",
+        OptiTri(g_opti.nr_enabled, "auto (= false)"), nrkeys, g_opti.upscaler,
+        OptiTri(g_opti.dlss_inputs, "auto (= true)"), OptiTri(g_opti.hook_original_only, "auto (= false)"),
+        g_opti.target_process);
 
     if (!g_opti.nr_fork)
-        Log("[host] WARNING: this OptiScaler is not the DLSS-NR fork: it will take the NGX calls and upscale, and no "
-            "neural pass will ever run. Use the Dagherbou/OptiScaler_DLSSNR build, or remove it and use Deep Fried "
+        Log("[host] WARNING: this OptiScaler is not a DLSS-NR fork: it will take the NGX calls and upscale, and no "
+            "neural pass will ever run. Use a DLSS-NR build (" OPTI_FORKS "), or remove it and use Deep Fried "
             "Chicken or renodx-dlss5 instead.");
     else
     {
@@ -767,6 +791,11 @@ static void DetectOptiScaler()
             "hook hands its own module to the NGX SDK), it runs its upscaler on the DLAA contract and then the neural "
             "model in place on the output. Its menu is on Insert in this window. No warm-up re-create: there is no "
             "hook to wait for.", OPTI_LABEL);
+        if (OptiProcessFilterMismatch(&g_opti, exe_name))
+            Log("[host] WARNING: OptiScaler.ini has [ProcessFilter] TargetProcessName=%s but this process is %s, so "
+                "OptiScaler is in pass-through mode: loaded, hooking nothing, no menu, no neural pass. It ships as auto; "
+                "an ini copied from a game folder brings the game's name along, and here the process is the helper. "
+                "Set it to auto and restart.", g_opti.target_process, exe_name);
         if (g_opti.nr_enabled != 1)
         {
             Log("[host] WARNING: [DlssNr] Enabled is %s in OptiScaler.ini -- the neural pass is OFF and OptiScaler "
@@ -774,10 +803,23 @@ static void DetectOptiScaler()
             OptiIniDefault(&g_opti, "DlssNr", "Enabled", "true", "the neural pass is what this helper exists for",
                            &Log, "host");
         }
-        if (g_opti.scan_exposure != 0)
+        // ScanExposure exists in the forwarder build only; the direct-runtime build deletes the
+        // key from the file whenever it saves, so writing it there would be noise.
+        if (!g_opti.direct && g_opti.scan_exposure != 0)
             OptiIniDefault(&g_opti, "DlssNr", "ScanExposure", "false",
                            "this helper passes AutoExposure and owns no exposure buffer; the scan would only hook "
                            "resource creation on its device", &Log, "host");
+        // FinishedPicture applies the edit at Present. This helper's Present is its own window,
+        // and the frame the game reads back is the shared texture written by the evaluate --
+        // so the edit would land where nobody looks.
+        if (g_opti.direct && g_opti.finished_picture == 1)
+            Log("[host] WARNING: [DlssNr] FinishedPicture=true in OptiScaler.ini: OptiScaler applies the neural edit at "
+                "Present, on the finished frame, instead of inside the evaluate. Here the presented frame is this "
+                "helper's own window, which the game never sees -- the game reads back the evaluate's output. Set "
+                "FinishedPicture=false and restart.");
+        if (OptiStrayForwarder(&g_opti))
+            Log("[host] " OPTI_FORWARDER " is beside %s, which is a direct-runtime build and never loads it -- a leftover "
+                "from the forwarder build; the fork's install notes say to delete it on upgrade", g_opti.module);
         if (g_opti.dlss_inputs == 0 || g_opti.hook_original_only == 1)
             Log("[host] WARNING: OptiScaler.ini has [Inputs] EnableDlssInputs=%s and [Hooks] HookOriginalNvngxOnly=%s -- "
                 "with these the NGX SDK in this helper is NOT redirected to OptiScaler and the driver answers instead "
@@ -1056,6 +1098,38 @@ static void HostEnableDred(const char *ini)
     g_dred_armed = true;
     Log("[host] DRED: auto-breadcrumbs and page-fault reporting enabled ([DLSS5Host] Dred=1). If "
         "D3D12CreateDevice fails below, set Dred=0 again");
+}
+
+// Extra evaluates of the SAME frame (experimentHold). In a game the 32-bit add-on's slider sends
+// the count on every frame message (FeedFrameMsg::settle_evals, IPC v11); [DLSS5Host]
+// SettleEvals=N (0..8) in this folder's ReShade.ini sets it for --test only, which has no
+// add-on to ask. Every neural pass the consumer runs inside our evaluate keeps
+// a temporal history that takes several evaluates to settle on a new framing (wilsjo2 measured
+// ~3-5 with a frozen input), and a multipass stack settles once per layer, one after the other.
+// So after the real evaluate, run N more on the same colour/depth with ZERO motion and no
+// reset: to the model that is N more frames in which nothing moved, and its history advances
+// that many steps before the output goes home. Costs (N+1)x the whole stack every frame, which
+// is the trade this experiment is about. Zero motion is done through the MV scale, which is
+// enough for OptiScaler (it hands our parameter object to the real DLSS and multiplies its
+// own NR vectors by it); a consumer that ignores the scale would double-advance instead.
+static int   g_settle_evals = 0;
+static float g_test_hold    = 0.0f;   // [DLSS5Host] HoldStrength, --test only: proves the stabiliser pass runs
+
+static void HostReadSettleEvals(const char *ini)
+{
+    int n = GetPrivateProfileIntA("DLSS5Host", "SettleEvals", 0, ini);
+    if (n < 0) n = 0;
+    if (n > 8) n = 8;
+    g_settle_evals = n;
+    char hs[32] = "";
+    GetPrivateProfileStringA("DLSS5Host", "HoldStrength", "0", hs, sizeof(hs), ini);
+    g_test_hold = static_cast<float>(atof(hs));
+    if (g_test_hold < 0.0f) g_test_hold = 0.0f;
+    if (g_test_hold > 1.0f) g_test_hold = 1.0f;
+    if (g_test_hold > 0.0f) Log("[host] hold: --test will run the output stabiliser at strength %.2f", g_test_hold);
+    if (n > 0)
+        Log("[host] settle: %d extra zero-motion evaluate(s) per frame for --test ([DLSS5Host] SettleEvals=%d); "
+            "in a game the add-on's slider decides", n, n);
 }
 
 // The name DRED reports for the list every frame is recorded into. That list is handed to
@@ -2189,6 +2263,7 @@ static bool InitDisguise()
         char ini[MAX_PATH];
         HostIniPath(ini, sizeof(ini));
         HostEnableDred(ini);   // must precede the create; does nothing unless [DLSS5Host] Dred=1
+        HostReadSettleEvals(ini);
     }
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
@@ -2360,18 +2435,23 @@ static void LogHostAdapter()
     // answers `supported` on 616.64. So the driver moved, and the v4.6+ engine is what does
     // not survive the move.
     //
+    // Later add-on generations do survive it. Measured on driver 617.14 (RTX 5090), same rig:
+    // v4.7 0/300 still, v6.1.0, v7.0.0-rc8 and v8.0.1 300/300 with feature 18 created and
+    // evaluated. So the warning is for the v4.6/v4.7 generation only (g_renodx_v6 = false).
+    //
     // Said up front, because the alternative is a helper that runs, logs nothing alarming
     // and delivers no neural frame -- which is exactly how this arrived as "the new driver
     // broke the 32-bit path" (issue #54).
     // The bound is >= 616.64 rather than == because there is no evidence a later driver
     // fixes it, and a warning that stops the moment NVIDIA ships 616.70 would be worse than
     // one that says plainly which driver it was measured on.
-    if (g_renodx_v46 && g_driver_x100 >= 61664)
+    if (g_renodx_v46 && !g_renodx_v6 && g_driver_x100 >= 61664)
         Log("[host] WARNING: renodx-dlss5 %s with NVIDIA driver %s is a combination measured to fail (on "
             "616.64 exactly; anything newer is untested here and assumed the same). The neural evaluate "
             "faults inside the driver's own NGX runtime -- an access violation in D3D12Core.dll, reached "
             "through nvngx_dlssnr.dll -- so DLSS 5 delivers nothing while everything else keeps working, "
-            "and there is nothing to fix on this side. Three things do work: Deep Fried Chicken as the "
+            "and there is nothing to fix on this side. Four things do work: a newer renodx-dlss5 (v6.1.0, "
+            "v7.0.0-rc8 and v8.0.1 were measured working on driver 617.14), Deep Fried Chicken as the "
             "neural consumer, a renodx-dlss5 build this helper does NOT report as v4.6+ (the classic build "
             "measured here is 391168 bytes, sha256 87aef9ddd937c724...; the rhi-repo 'renodx-dlss5-4.55' "
             "download is a different build, banner v4.1.5, with the v4.6 engine markers), or driver 616.56. "
@@ -2663,11 +2743,30 @@ static void OptiBarriers(ID3D12Resource *const *inputs, int n_inputs, ID3D12Reso
     if (n > 0) h.list->ResourceBarrier(n, b);
 }
 
+// The output stabiliser (feed_hold12.h), built on first use. Its compiler is the same
+// d3dcompiler_47 DetectStaleD3DCompiler already loaded, resolved by name.
+static FeedHold12 g_hold = {};
+
+static bool HoldPassReady()
+{
+    if (g_hold.ok) return true;
+    if (g_hold.failed) return false;
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[hold] d3dcompiler_47.dll has no D3DCompile; stabiliser unavailable"); g_hold.failed = true; return false; }
+    return FeedHold12Init(g_hold, h.dev, compile, &Log);
+}
+
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
-                     UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f)
+                     UINT w, UINT h_, int reset, float mvsx, float mvsy, float jitter_x = 0.0f, float jitter_y = 0.0f,
+                     int settle = -1,   // -1 = the ini value (--test); a game sends its own every frame
+                     float hold_strength = 0.0f, float hold_tolerance = 0.04f)
 {
     if (NgxRefuse("evaluate")) return false;
     if (!BeginCommands()) return false;
+    if (settle < 0) settle = g_settle_evals;
+    if (settle > 8) settle = 8;
+    const bool hold = hold_strength > 0.0f && HoldPassReady();
 
     NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
     ep.Feature.pInColor  = color;
@@ -2696,6 +2795,28 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     DWORD ecode = 0;
     NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
     if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    // SettleEvals: the same frame again, N times, with nothing moving -- see g_settle_evals.
+    // Same list, same states; only the output needs a UAV barrier between two writes.
+    for (int i = 0; i < settle && NVSDK_NGX_SUCCEED(re); ++i)
+    {
+        D3D12_RESOURCE_BARRIER uav = {};
+        uav.Type          = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        uav.UAV.pResource = output;
+        h.list->ResourceBarrier(1, &uav);
+        ep.InReset    = 0;
+        ep.InMVScaleX = 0.0f;
+        ep.InMVScaleY = 0.0f;
+        re = SafeEvaluateDLSS(&ep, &ecode);
+        if (ecode != 0) { AbortCommands(); LogNgxFault("evaluate"); return false; }
+    }
+    // The stabiliser reads the model's answer and the input in the evaluate's own states and
+    // leaves them there, so the barriers below see what they expect.
+    if (hold && NVSDK_NGX_SUCCEED(re))
+    {
+        static bool said = false;
+        if (!said) { said = true; Log("[host] hold: output stabiliser active (strength %.2f, tolerance %.3f)", hold_strength, hold_tolerance); }
+        FeedHold12Run(g_hold, h.list, color, output, hold_strength, hold_tolerance, reset != 0, &Log);
+    }
     if (g_opti.routed)
     {
         OptiBarriers(opti_in, 3, nullptr, false);
@@ -2730,6 +2851,39 @@ static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resour
     }
     EndCommands();
     if (NVSDK_NGX_FAILED(re)) { Log("[host] evaluate failed 0x%08X (%s)", re, NgxResultName(re)); return false; }
+    return true;
+}
+
+static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav);
+
+// FEED_FRAME_HOLD_INPUT (experimentHold diagnostic): private copies of Color and Depth taken on
+// the first flagged frame and handed to the model instead of the live slots until the flag
+// drops. The copy is its own submission so the copies have decayed to COMMON by the time the
+// evaluate's barriers (OptiBarriers assumes COMMON) run.
+static ID3D12Resource *g_hold_color = nullptr, *g_hold_depth = nullptr;
+
+static void HoldRelease(bool drain)
+{
+    if (g_hold_color == nullptr && g_hold_depth == nullptr) return;
+    if (drain && h.fence != nullptr) WaitFenceValue(h.fence, h.fence_value, 2000);   // the last evaluate read them
+    if (g_hold_color != nullptr) { g_hold_color->Release(); g_hold_color = nullptr; }
+    if (g_hold_depth != nullptr) { g_hold_depth->Release(); g_hold_depth = nullptr; }
+    Log("[host] hold: input released; the model sees the live frame again");
+}
+
+static bool HoldCapture(ID3D12Resource *color, ID3D12Resource *depth)
+{
+    if (g_hold_color != nullptr) return true;   // already held
+    if (color == nullptr || depth == nullptr) return false;
+    const D3D12_RESOURCE_DESC cd = color->GetDesc(), dd = depth->GetDesc();
+    g_hold_color = MakeTex(static_cast<UINT>(cd.Width), cd.Height, cd.Format, false);
+    g_hold_depth = MakeTex(static_cast<UINT>(dd.Width), dd.Height, dd.Format, false);
+    if (g_hold_color == nullptr || g_hold_depth == nullptr || !BeginCommands()) { HoldRelease(false); return false; }
+    h.list->CopyResource(g_hold_color, color);
+    h.list->CopyResource(g_hold_depth, depth);
+    if (EndCommands() == 0) { HoldRelease(true); return false; }
+    Log("[host] hold: input frozen (%llux%u colour + depth captured; zero motion until released)",
+        cd.Width, cd.Height);
     return true;
 }
 
@@ -2855,9 +3009,10 @@ static int RunTest()
     for (int i = 0; i < 300; ++i)
     {
         PumpPresent(true);
-        if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f)) ++good;
+        if (Evaluate(color, output, depth, mv, W, H, i == 0 ? 1 : 0, 1.0f, 1.0f, 0.0f, 0.0f, -1, g_test_hold)) ++good;
         else break;
-        if (i == 1 && g_opti.routed) OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
+        if (i >= 1 && g_opti.routed && !g_opti_backend.checked)
+            OptiBackendCheck(&Log, "host", g_opti.upscaler, g_opti.direct, &g_opti_backend);
         if (i == 180 && !g_opti.routed)   // the warm-up re-create, same medicine as in-game; OptiScaler is the callee and needs none
         {
             Log("[host] warm-up: re-creating the feature once");
@@ -3165,6 +3320,8 @@ static int Serve(DWORD game_pid)
             for (int i = 0; i < FEED_SLOTS; ++i)
                 if (h.tex[i] != nullptr) { h.tex[i]->Release(); h.tex[i] = nullptr; }
             if (h.out_scratch != nullptr) { h.out_scratch->Release(); h.out_scratch = nullptr; }
+            HoldRelease(false);   // sized for the old slots
+            FeedHold12DropHistory(g_hold);
 
             bool ok = true;
             uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {}, game_panel = 0;
@@ -3538,9 +3695,26 @@ static int Serve(DWORD game_pid)
                 }
             }
             else
-                done = Evaluate(h.tex[FEED_COLOR], h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
-                                h.tex[FEED_DEPTH], h.tex[FEED_MV],
-                                h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy, fm.jitter_x, fm.jitter_y);
+            {
+                static uint32_t settle_seen = ~0u;
+                if (fm.settle_evals != settle_seen)
+                {
+                    settle_seen = fm.settle_evals;
+                    Log("[host] settle: %u extra zero-motion evaluate(s) per frame (from the add-on's slider)", fm.settle_evals);
+                }
+                ID3D12Resource *color = h.tex[FEED_COLOR], *depth = h.tex[FEED_DEPTH];
+                float fmvx = mvsx, fmvy = mvsy;
+                if (fm.flags & FEED_FRAME_HOLD_INPUT)
+                {
+                    if (HoldCapture(color, depth)) { color = g_hold_color; depth = g_hold_depth; fmvx = fmvy = 0.0f; }
+                }
+                else
+                    HoldRelease(true);
+                done = Evaluate(color, h.out_scratch != nullptr ? h.out_scratch : h.tex[FEED_OUTPUT],
+                                depth, h.tex[FEED_MV],
+                                h.width, h.height, fm.reset ? 1 : 0, fmvx, fmvy, fm.jitter_x, fm.jitter_y,
+                                static_cast<int>(fm.settle_evals), fm.hold_strength, fm.hold_tolerance);
+            }
 
             if (done)
             {
@@ -3550,8 +3724,8 @@ static int Serve(DWORD game_pid)
                     outcome_logged = true;
                     LogNeuralConsumerOutcome();
                 }
-                if (g_opti.routed && !g_opti_backend.checked && ++opti_frames == 2)
-                    OptiBackendCheck(&Log, "host", g_opti.upscaler, &g_opti_backend);
+                if (g_opti.routed && !g_opti_backend.checked && ++opti_frames >= 2)
+                    OptiBackendCheck(&Log, "host", g_opti.upscaler, g_opti.direct, &g_opti_backend);
                 // One warm-up re-create per build. RenoDX: it misses the very first create
                 // (STANDBY latch) when its hooks armed a moment too late, so re-create at a
                 // fixed frame count. Chicken: it arms its detours seconds after claiming, and

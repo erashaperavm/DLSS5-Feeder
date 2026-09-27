@@ -30,19 +30,31 @@
 > `host64\dlss5-feed-host64.exe --test` (`300/300 evaluates succeeded` means you are fine). The
 > scenarios we know about:
 >
-> | neural consumer | driver **616.56** | driver **616.64** |
-> |---|---|---|
-> | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 |
-> | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 |
-> | `renodx-dlss5` **v4.55** (classic engine) | — | ✅ 300/300 |
-> | `renodx-dlss5` **"latest"** (classic engine) | — | ✅ 300/300 |
-> | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 |
-> | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 |
+> | neural consumer | driver **616.56** | driver **616.64** | driver **617.14** |
+> |---|---|---|---|
+> | *(none — DLAA only, no neural pass)* | — | ✅ 300/300 | — |
+> | **Deep Fried Chicken** 1.4.8-alpha | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **v4.55** (classic engine) | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **"latest"** (classic engine) | — | ✅ 300/300 | — |
+> | `renodx-dlss5` **v4.6** (lazy-adoption engine) | — | ❌ 1/300 | — |
+> | `renodx-dlss5` **v4.7** (lazy-adoption engine) | ✅ 300/300 | ❌ 0/300 | ❌ 0/300 |
+> | `renodx-dlss5` **v6.1.0** | — | — | ✅ 300/300 |
+> | `renodx-dlss5` **v7.0.0-rc8** | — | — | ✅ 300/300 |
+> | `renodx-dlss5` **v8.0.1** (beta 8) | — | — | ✅ 300/300 |
 >
 > Blank cells are combinations nobody has run. Measured with `--test` on one RTX 5090 through the
-> 64-bit helper. On 616.64+ the evaluate faults inside NVIDIA's own `nvngx_dlssnr.dll`
-> ([#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — **any one of these works:** Deep
-> Fried Chicken, a classic-engine `renodx-dlss5`, or driver 616.56.
+> 64-bit helper; every ✅ on 617.14 also created and evaluated the neural feature. On 616.64+ the
+> v4.6/v4.7 evaluate faults inside NVIDIA's own `nvngx_dlssnr.dll`
+> ([#54](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/54)) — **any one of these works:** a
+> `renodx-dlss5` **v6.1 or newer** (what the installer now downloads), Deep Fried Chicken, a
+> classic-engine `renodx-dlss5`, or driver 616.56.
+>
+> **The neural model runs on RTX 50 only.** NVIDIA's signed `nvngx_dlssnr.dll` 310.8.0, and the
+> modified 310.8.Lecram build the installer downloads, create the neural feature on RTX 50-series
+> GPUs only. On an RTX 20/30/40 DLSS still runs but the neural pass does not (`feature 18 create
+> failed with 0xbad00001` in `ReShade.log`, [#131](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/131)):
+> get the modified `nvngx_dlssnr.dll` made for your GPU from the
+> [RenoDX Discord](https://discord.com/invite/renodx). `Verify-DLSS5Feeder.ps1` says so at the end.
 >
 > Use **0.14.0-beta.2 or newer**, and run `Verify-DLSS5Feeder.ps1` in the game folder before reporting anything.
 
@@ -146,7 +158,8 @@ file and its own overlay tab.
 
 | Build | Marker | What the feeder does about it |
 | --- | --- | --- |
-| v4.7 | `NRGlobalTone` | Newest, checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
+| v6+ (v6.1.0, v7.0.0-rc8, v8.0.1) | `NRGlobalTone` + version banner v6 or newer | Checked 2026-09-25. Same markers as v4.7, told apart by the add-on's version banner (or its build date). Survives driver 616.64+, so the helper no longer warns about it. v8 migrates an ini without `ConfigVersion` on first launch and puts the helper's unbound hotkeys back to F6/F5; in `host64` that is harmless, as it ignores them unless the helper's window is in front. |
+| v4.7 | `NRGlobalTone` | Checked 2026-09-01. Replaces the paper-white codec with a reversible colour bridge (SDR sRGB / linear HDR BT.709 / PQ BT.2020) picked from the contract the feeder already publishes, plus a fenced D3D12 workset pool. Nothing new is required from the feeder; the 32-bit overlay mirrors its renamed sliders and its two new keys. |
 | v4.6 | `NRToggleKey` | Global hotkeys, WIP upscaling with a rejection latch, richer decline diagnostics. See the `NRStyle=2` note under Smooth Motion below. |
 | v45+ | `EnableHooks` | Rescans every present and adopts missed features lazily, so the feeder skips its warm-up re-create. |
 | older | — | Classic single hook pass; the warm-up re-create stays on. |
@@ -171,9 +184,10 @@ generations were checked against the shipped binaries.
 
 - **OptiScaler** — a stock OptiScaler must be off. It takes over the very NGX calls this project
   makes, upscales them, and never runs a neural pass, so the picture never changes while every log
-  reads healthy. The one exception is the **OptiScaler_DLSSNR fork**, which *is* a supported neural
-  consumer — see [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr). With it
-  installed there must be no Deep Fried Chicken and no RenoDX add-on beside it.
+  reads healthy. The exception is a **DLSS-NR fork** of it (wilsjo2's OptiScaler-DLSSNR-PreSR-Multipass
+  or Dagherbou's OptiScaler_DLSSNR), which *is* a supported neural consumer — see
+  [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr). With it installed there
+  must be no Deep Fried Chicken and no RenoDX add-on beside it.
 - **NVIDIA Smooth Motion** — turn it off **for Vulkan games only**. On Vulkan the two cannot work
   together, and no future release can fix that. You would see roughly half your frames
   unprocessed, which looks like heavy flickering or a picture stuck on an old frame. Nothing is
@@ -419,12 +433,14 @@ Things to know:
   Nothing is excluded without your yes.
 - Vulkan games need one UAC prompt to register ReShade's layer and add the exe to
   `ReShadeApps.ini`. `-NoElevate` turns every such step into printed instructions instead.
-- **It asks which neural consumer you want** before downloading anything: Deep Fried Chicken,
-  or Krish's RenoDX DLSS 5 add-on. Both are fetched automatically, only one is ever installed,
-  and if the other is already in the folder it offers to disable it. `-Consumer DFC` or
-  `-Consumer RenoDX` answers that in advance for an unattended run.
+- **It asks which neural consumer you want** before downloading anything: Krish's RenoDX DLSS 5
+  add-on (the default), OptiScaler DLSS-NR, or Deep Fried Chicken. The first two are downloaded
+  for you; Chicken has no public download, so the script asks you to fetch it. Only one is ever
+  installed, and if another is already in the folder it offers to disable it. For OptiScaler it
+  also asks which fork: wilsjo2's (the default) or Dagherbou's. `-Consumer RenoDX|OptiScaler|DFC`
+  and `-OptiScalerFork wilsjo2|Dagherbou` answer both in advance for an unattended run.
 - Pieces you already have go in a folder passed with `-LocalFiles`, or one at a time with
-  `-DfcZip`, `-RenoDxAddon`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`,
+  `-DfcZip`, `-RenoDxAddon`, `-OptiScalerZip`, `-DlssNrDll`, `-DlssDll`, `-FeederZip`, `-ReShadeSetup`,
   `-LumeniteZip`, `-DgVoodooZip`.
 - `-Api D3D|Vulkan|OpenGL|D3D9|D3D8` overrides the detection (some engines, Max Payne 3 among
   them, can run on either Direct3D 9 or 11; the script assumes 11 and says so).
@@ -562,40 +578,66 @@ the list of build generations:
 
 ### Alternative: OptiScaler DLSS-NR
 
-**[OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR/releases)** (Dagherbou) is an
-OptiScaler fork with the DLSS 5 neural-rendering model built in, as a pass after its upscaler. It
-is not a hook over NVIDIA's NGX like the two add-ons above: it *is* the NGX implementation the
-process talks to. Installed the normal OptiScaler way, its loader hook hands its own module to the
-NGX SDK inside this feeder, so the feeder's DLAA request is upscaled by OptiScaler (`dlss` by
-default, so nothing changes there) and then given the neural pass, in place. The feeder detects
-it, checks that its calls really went there, and skips the warm-up re-create the other two need.
-On the no-game rig the pass costs the same whether OptiScaler runs DLSS, XeSS or FSR underneath.
-The installer does all of the below with `-Consumer OptiScaler`.
+Two OptiScaler forks have the DLSS 5 neural-rendering model built in, as a pass on their
+upscaler's output, and both are supported here:
+**[OptiScaler-DLSSNR-PreSR-Multipass](https://github.com/wilsjo2/OptiScaler-DLSSNR-PreSR-Multipass/releases)**
+(wilsjo2; actively maintained, pre-SR / multipass / finished-picture options, no forwarder DLL
+since v0.8.1) and **[OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR/releases)**
+(Dagherbou; the original, ships its `nvngx.dll_dlssnr.dll` forwarder). Neither is a hook over
+NVIDIA's NGX like the two add-ons above: it *is* the NGX implementation the process talks to.
+Installed the normal OptiScaler way, its loader hook hands its own module to the NGX SDK inside
+this feeder, so the feeder's DLAA request is upscaled by OptiScaler (`dlss` by default, so nothing
+changes there) and then given the neural pass, in place. The feeder detects it, tells the two
+generations apart (it logs `direct-runtime build` for wilsjo2 v0.8.1+ and `forwarder build` for
+Dagherbou), checks that its calls really went there, and skips the warm-up re-create the other two
+need. On the no-game rig the pass costs the same whether OptiScaler runs DLSS, XeSS or FSR
+underneath. The installer does all of the below with `-Consumer OptiScaler` and asks which fork
+(`-OptiScalerFork wilsjo2|Dagherbou` to skip the question; `-Yes` takes wilsjo2).
 
-- Get `OptiScaler-DLSSNR-<version>.zip` from the fork's releases page (about 130 MB;
-  `nvngx_dlssnr.dll` is not in it — you supply that as always). Extract everything into the folder
-  where the DLSS work happens: next to the game `.exe` for a 64-bit game, into `host64\` for a
-  32-bit one.
+- Get the release zip from the fork's releases page (`OptiScaler-NR-v<version>.zip` for wilsjo2,
+  not the `-rtx40-mfg` variant; `OptiScaler-DLSSNR-<version>.zip` for Dagherbou; about 130 MB
+  either way; `nvngx_dlssnr.dll` is not in it — you supply that as always). Extract it into the
+  folder where the DLSS work happens: next to the game `.exe` for a 64-bit game, into `host64\`
+  for a 32-bit one. wilsjo2's `docs\`, `images\` and `tests\` folders can stay out.
 - Rename `OptiScaler.dll` to **`winmm.dll`** (or `version.dll`). ReShade keeps `dxgi.dll`. The name
   must be one the process imports at start: `dlss5-feed-host64.exe` imports both of those, and
   most games import `winmm.dll`. Do **not** run OptiScaler's own `setup_windows.bat` — it wants
   `dxgi.dll`.
-- In `OptiScaler.ini`, under `[DlssNr]` set `Enabled=true` (it ships off) and `ScanExposure=false`;
-  under `[Upscalers]` set `Dx12Upscaler=dlss`.
+- In `OptiScaler.ini`, under `[DlssNr]` set `Enabled=true` (both ship off); under `[Upscalers]`
+  set `Dx12Upscaler=dlss`. Dagherbou's build only: `ScanExposure=false` too (wilsjo2's dropped the
+  key). Leave `[DlssNr] FinishedPicture=false` (wilsjo2): `true` moves the pass from the feeder's
+  evaluate to the game's Present, and on the 32-bit path that is the helper's own window, which
+  the game never sees. Leave `[ProcessFilter] TargetProcessName=auto`: an ini copied from a game
+  folder carries that game's name and puts OptiScaler into pass-through (no hooks, no menu).
+- Switching from Dagherbou's build to wilsjo2's: delete the leftover `nvngx.dll_dlssnr.dll`
+  (nothing loads it any more; the fork's own install notes say so). The installer renames it.
 - Remove Deep Fried Chicken's three files and any `renodx-dlss5*.addon64` from that folder.
   OptiScaler captures every `nvngx` load in the process — Chicken's own bridge DLL ends in
   `nvngx.dll` — so a second consumer either talks to OptiScaler or runs a second neural pass.
-- OptiScaler's menu opens with **Insert**; "DLSS Neural Rendering" is its last section. For a
-  32-bit game the menu is in the helper: press **Show the DLSS 5 panel in-game** and then Insert,
-  or run with `host_window=1`.
+- OptiScaler's menu opens with **Insert**; its neural-rendering section holds the pass controls.
+  For a 32-bit game the menu is in the helper: press **Show the DLSS 5 panel in-game** and then
+  Insert, or run with `host_window=1`.
+- **Model resolution below 100% flickers on wilsjo2's builds up to v0.8.91** and keeps "settling"
+  for a few frames after the camera stops, at every scale below 100%. The cause is in the fork's
+  reduced path: the model was given a colour at the working size and depth / motion vectors at the
+  frame's size. A fixed build is on
+  [this project's fork, release v0.8.92](https://github.com/jlrouzies-fr/OptiScaler-DLSSNR-PreSR-Multipass/releases/tag/v0.8.92)
+  (v0.8.91 plus that one change, offered upstream as a pull request): same zip layout, same
+  install. `[DlssNr] MatchGuides=false` in its `OptiScaler.ini` brings the old behaviour back for
+  a comparison. The feeder's own **Work resolution** (`work_resolution`) is the other way to run
+  the model below native, and was never affected: it shrinks the whole frame and makes the guides
+  at that size.
 
 `dlss5-feed.log` (or `host64\dlss5-feed-host.log`) then says `NGX calls are routed through
-OptiScaler DLSS-NR (winmm.dll)` and, after the first frame, `neural model (feature 18) loaded`. If it
+OptiScaler DLSS-NR (winmm.dll)` and, after the first frames, `neural model (feature 18) loaded`
+(Dagherbou's build has the model up by the second evaluate; wilsjo2's creates it on its own
+schedule, so the feeder keeps looking for up to 120 evaluates before it calls it absent). If it
 says the DRIVER answered the probe, OptiScaler is present but its redirect did not take (its
-`[Inputs] EnableDlssInputs` and `[Hooks] HookOriginalNvngxOnly` keys are the two that can do that).
-If the model is `NOT loaded`, `OptiScaler.log` beside the DLL names the missing piece. A stock
-OptiScaler build is reported as such: it upscales and never runs a neural pass.
-`Verify-DLSS5Feeder.ps1` checks the whole layout and reads both logs.
+`[Inputs] EnableDlssInputs` and `[Hooks] HookOriginalNvngxOnly` keys are the two that can do that,
+and so can a `TargetProcessName` that names another exe). If the model is `NOT loaded`,
+`OptiScaler.log` beside the DLL names the missing piece. A stock OptiScaler build is reported as
+such: it upscales and never runs a neural pass. `Verify-DLSS5Feeder.ps1` checks the whole layout,
+knows both generations, and reads both logs.
 
 ## Install for a 32-bit game (beta)
 
@@ -1102,6 +1144,7 @@ if you prefer editing the file directly:
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
+| `settle_evals` | 0 | **Diagnostic, both add-ons and the helper, since 1.17.0-beta.2.** N extra evaluates (0..8) of the *same* frame after the real one, with zero motion and no reset, before the result goes home; a slider on the overlay page. It was built to test whether the neural consumer's "settling" after a camera stop was its temporal history catching up: it is not (nine evaluates a frame changed nothing, see `hold_strength`), so this only costs frame time. Kept because it answers that question in any game in a minute. |
 | `warmup_rebuild` | 180 | **RenoDX path only.** Re-create the feature once after N delivered frames, working around older RenoDX builds latching STANDBY on their first create. Skipped automatically on "v45+" builds. **Not used as a frame count while Deep Fried Chicken is present** — there the one re-create is triggered by Chicken's own `ARMED` state instead (it arms its NGX detours seconds after claiming, and never adopts a create it did not see). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
@@ -1122,6 +1165,11 @@ if you prefer editing the file directly:
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
 | `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+| `native_dlss_ok` | 0 | **D3D12 games (64-bit), parse-only.** Since 1.17.0-beta.2 the same-device D3D12 session refuses to open when the game has loaded a DLSS runtime of its own (`nvngx_dlss.dll` / `nvngx_dlssd.dll` from anywhere other than this add-on's folder or the driver, or Streamline's `sl.dlss.dll`). A second DLSS contract on the game's device is what crashed the neural consumer in #130; in such a game, turn DLSS on in its own settings and let the DLSS 5 add-on use that instead. `1` opens the session anyway. |
+| `hold_strength` | 0 | **Experimental output stabiliser, since 1.17.0-beta.2 (32-bit games) / beta.3 (64-bit, all four transports).** The neural consumer re-decides what a still region should look like from small frame-to-frame differences in its input: a slope under a tree is bright while the camera pans and darkens over the frames after the stop, although the game drew it the same way on every one of them (and a reset on every frame still darkens, so it is not history). The helper runs one compute pass after the evaluate: per output pixel it compares a 3x3 box of the game's frame with an anchor (that box as it was when the pixel last moved), relative to local brightness. Where the input moved, the model's answer shows as is and the anchor follows; where it did not, the shown pixel keeps this much of last frame's value and takes the rest from the model. 0 = off, 1 = a still region never moves until its input changes, 0.9 = the model's new opinion fades in over about ten frames. No reprojection, so nothing ghosts: a pixel whose input changed shows the current output that frame. A slider on the overlay page ("Output stabiliser"), applied live. On the 64-bit add-on it runs on the same device as the evaluate, so on the same-device D3D12 transport that is the game's device. |
+| `hold_tolerance` | 0.04 | How much a pixel's input (3x3 box, relative to its brightness) may differ from its anchor and still count as still: 0.04 = 4%. Below it the pixel is held; at twice it the model shows through fully. Raise it if a held region unlocks by itself (exposure drift, shimmer), lower it if slow animation lags behind. |
+| `hold_input` | 0 | **32-bit games, diagnostic, never written back.** 1 freezes the colour and depth the helper hands the model, with zero motion, until it is set back to 0 (a checkbox on the overlay page). The game keeps rendering; only the model's input is frozen. Tells "the model drifts on a constant input" from "the game's frame keeps changing after the camera stops". |
+| `wine_fence_import` | 0 | **32-bit Vulkan games under Wine/Proton, parse-only.** Wine 11 cannot import a D3D12 fence created in another process, and the 32-bit add-on's fences always come from the 64-bit helper: the attempt faults inside Wine and closes the game (#121). Since 1.17.0-beta.2 the add-on imports the shared textures first, then stops cleanly instead of importing the fences. `1` tries anyway, for a Wine build that has closed that gap. |
 
 **For neural consumers that draw their own UI in the helper window.** The cast draws the helper's
 window into the game, and what reaches the helper from it is ordinary posted `WM_*` input that says
@@ -1341,9 +1389,11 @@ Common cases:
 
   616.64 also changed what NGX says about the feature that path creates: the requirements query for
   feature 18 answered `NotImplemented` (`0xBAD00012`) on 616.56 and answers `supported` on 616.64.
-  So the driver moved and the v4.6+ engine is what does not survive the move. **Three fixes, any
-  one of them:** use Deep Fried Chicken as the neural consumer, use a classic-engine
-  `renodx-dlss5` build, or roll the driver back to 616.56. Run
+  So the driver moved and the v4.6/v4.7 engine is what does not survive the move. **Four fixes, any
+  one of them:** update `renodx-dlss5` to **v6.1 or newer** (v6.1.0, v7.0.0-rc8 and v8.0.1 all pass
+  300/300 on driver 617.14, where v4.7 still gives 0/300; the installer downloads the newest), use
+  Deep Fried Chicken as the neural consumer, use a classic-engine `renodx-dlss5` build, or roll the
+  driver back to 616.56. Run
   `host64\dlss5-feed-host64.exe --test` to check your own combination in about fifteen seconds.
 * **32-bit game: `dlss5-feed.addon64` in `host64\`** — it does not belong there and 0.14.0-beta.1
   refuses to run when it finds itself in the helper. `host64\` takes `dlss5-feed-host64.exe`, a
@@ -1371,10 +1421,11 @@ Common cases:
   not retire allocator slot N within 2000 ms`, the GPU is not keeping up rather than broken: raise
   `gpu_timeout_ms`. A single slow frame no longer stops the session — three consecutive failures do.
 * **OptiScaler is installed and nothing looks neural** — `dlss5-feed.log` (or the host log) should
-  read `NGX calls are routed through OptiScaler DLSS-NR` and, a frame later, `neural model (feature
-  18) loaded`. `the DRIVER answered the NGX probe` means OptiScaler's redirect did not take; `NEURAL
-  MODEL NOT CREATED` means it never built the pass and `OptiScaler.log` beside it says why; `not the
-  DLSS-NR fork` means a stock OptiScaler, which can only upscale. See
+  read `NGX calls are routed through OptiScaler DLSS-NR` and, a few frames later, `neural model
+  (feature 18) loaded`. `the DRIVER answered the NGX probe` means OptiScaler's redirect did not take
+  (or `[ProcessFilter] TargetProcessName` names another exe); `NEURAL MODEL NOT CREATED` means it
+  never built the pass and `OptiScaler.log` beside it says why; `not a DLSS-NR fork` means a stock
+  OptiScaler, which can only upscale. Both forks (wilsjo2, Dagherbou) are recognised. See
   [Alternative: OptiScaler DLSS-NR](#alternative-optiscaler-dlss-nr).
 * **Corruption or flicker with Smooth Motion on** — see [Before you install](#3-optiscaler-only-the-dlss-nr-fork-and-smooth-motion-off-on-vulkan) at the top of
   this README. The overlay says whether Smooth Motion was detected, and `dlss5-feed.log` records the feeding
@@ -1514,7 +1565,8 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
   the 32-bit x64 helper — its other backends are source-contract compatible per its author, and it
   claims neither Frame Generation nor 32-bit Vulkan. OptiScaler DLSS-NR, the third option and the
   open-source one, is validated on the no-game helper rig (300/300 evaluates, neural pass confirmed
-  over its DLSS, XeSS and FSR backends); in-game rows land in [Status](#status) as they are run.
+  over its DLSS, XeSS and FSR backends with Dagherbou's build, and over DLSS with wilsjo2's v0.8.8);
+  in-game rows land in [Status](#status) as they are run.
   With OptiScaler in the process, a game that has DLSS of its own gets *that* captured too — this
   project is for games without DLSS, and the add-on says so when it sees Streamline.
 * The **32-bit and D3D9 paths are beta** — see [`docs/PLAN-32BIT.md`](docs/PLAN-32BIT.md) for the full design
