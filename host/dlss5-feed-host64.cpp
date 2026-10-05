@@ -2152,6 +2152,41 @@ static bool ReShadeOwnsCreateDevice(HMODULE d3d12, FARPROC p)
     return b[0] == 0xE9 || b[0] == 0xEB || (b[0] == 0xFF && b[1] == 0x25);
 }
 
+// The NGX / DLSS 5 runtime is NVIDIA's, and on a hybrid laptop DXGI's DEFAULT adapter -- what
+// nullptr asks for -- is the integrated GPU. Creating the device that way landed every run on
+// "Intel(R) UHD Graphics" and NGX answered FeatureNotSupported before the add-on could do
+// anything (the host log said as much: "This adapter is not an NVIDIA GPU ... nothing below can
+// succeed"). Ask for the NVIDIA adapter (vendor 0x10DE) explicitly instead. nullptr still means
+// "DXGI's default", and that is what we return when there is no NVIDIA adapter -- so a
+// single-GPU desktop, and --test on a machine whose default already IS the NVIDIA GPU, are
+// unchanged. The caller owns the returned reference.
+static IDXGIAdapter1 *PickNgxAdapter(PFN_CreateDXGIFactory1_ create_factory)
+{
+    if (create_factory == nullptr) return nullptr;
+    IDXGIFactory1 *f = nullptr;
+    if (FAILED(create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&f))) || f == nullptr)
+        return nullptr;
+    IDXGIAdapter1 *pick = nullptr;
+    for (UINT i = 0; ; ++i)
+    {
+        IDXGIAdapter1 *a = nullptr;
+        if (f->EnumAdapters1(i, &a) != S_OK || a == nullptr) break;
+        DXGI_ADAPTER_DESC1 d = {};
+        a->GetDesc1(&d);
+        if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && d.VendorId == 0x10DE) { pick = a; break; }   // NVIDIA
+        a->Release();
+    }
+    f->Release();
+    if (pick != nullptr)
+    {
+        DXGI_ADAPTER_DESC1 d = {};
+        pick->GetDesc1(&d);
+        Log("[host] adapter: forcing NVIDIA GPU \"%ls\" (PCI %04X:%04X) -- DXGI's default here is not "
+            "NVIDIA, and NGX cannot run on that one", d.Description, d.VendorId, d.DeviceId);
+    }
+    return pick;
+}
+
 static bool InitDisguise()
 {
     // ReShade first: the app-directory dxgi.dll IS ReShade x64. Loading it before
@@ -2268,8 +2303,12 @@ static bool InitDisguise()
         HostEnableDred(ini);   // must precede the create; does nothing unless [DLSS5Host] Dred=1
         HostReadSettleEvals(ini);
     }
-    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+    // Prefer the NVIDIA adapter: on a hybrid laptop DXGI's default is the integrated GPU and
+    // NGX refuses to initialise on it (see PickNgxAdapter). nullptr when there is none.
+    IDXGIAdapter1 *ngx_adapter = PickNgxAdapter(create_factory);
+    HRESULT hr = create_device(ngx_adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
+    if (ngx_adapter != nullptr) ngx_adapter->Release();
     if (FAILED(hr))
     {
         Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr));
