@@ -3151,6 +3151,18 @@ static bool JsonBool(const char *text, const char *key, bool *out)
     return false;
 }
 
+// A quoted JSON string value, for the capture's format names.
+static bool JsonStr(const char *text, const char *key, std::string *out)
+{
+    const char *v = nullptr;
+    if (!JsonFind(text, key, &v) || *v != '"') return false;
+    ++v;
+    const char *e = strchr(v, '"');
+    if (e == nullptr) return false;
+    out->assign(v, static_cast<size_t>(e - v));
+    return true;
+}
+
 // IEEE 754 binary16 -> float, as a table built once (the capture is all half floats).
 static const float *HalfLut()
 {
@@ -3185,6 +3197,25 @@ static const uint8_t *GammaLut()
             lut[i] = static_cast<uint8_t>(powf(static_cast<float>(i) / 1023.0f, 1.0f / 2.2f) * 255.0f + 0.5f);
     }
     return lut;
+}
+
+// DXGI_FORMAT_R11G11B10_FLOAT -> 3 floats. R and G are 5-bit exponent + 6-bit mantissa,
+// B is 5-bit exponent + 5-bit mantissa; all unsigned (colour is never negative).
+static void UnpackR11G11B10(uint32_t p, float out[3])
+{
+    for (int i = 0; i < 3; ++i)
+    {
+        const int mantBits = (i == 2) ? 5 : 6;
+        const uint32_t v = (i == 0) ? (p & 0x7FFu) : (i == 1) ? ((p >> 11) & 0x7FFu) : ((p >> 22) & 0x3FFu);
+        const uint32_t e = (v >> mantBits) & 0x1Fu;
+        const uint32_t m = v & ((1u << mantBits) - 1u);
+        float f;
+        if (e == 0)       f = static_cast<float>(m) * ldexpf(1.0f, -14 - mantBits);
+        else if (e == 31) f = 3.0e38f;
+        else              f = (1.0f + static_cast<float>(m) / static_cast<float>(1u << mantBits)) *
+                              ldexpf(1.0f, static_cast<int>(e) - 15);
+        out[i] = f;
+    }
 }
 
 // 24-bit BMP, bottom-up BGR: the frames must open by double-click on any Windows
@@ -3343,6 +3374,18 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     JsonBool(fj.c_str(), "is_hdr", &is_hdr);
     if (rw <= 0 || rh <= 0) { Log("[host] --capture: frame.json has no render_width/height"); return 1; }
 
+    // On-disk formats. The capture layer may compact (motion -> RG16F, colour -> R11G11B10F);
+    // follow frame.json rather than assuming, so old (uncompacted) and new sessions both read.
+    std::string colorFmt, motionFmt;
+    JsonStr(fj.c_str(), "color_format", &colorFmt);
+    JsonStr(fj.c_str(), "motion_format", &motionFmt);
+    if (colorFmt.empty())  colorFmt  = "DXGI_FORMAT_R16G16B16A16_FLOAT";
+    if (motionFmt.empty()) motionFmt = "DXGI_FORMAT_R16G16B16A16_FLOAT";
+    const bool colorR11   = (colorFmt  == "DXGI_FORMAT_R11G11B10_FLOAT");
+    const bool motionRG16 = (motionFmt == "DXGI_FORMAT_R16G16_FLOAT");
+    const size_t colorBpp  = colorR11   ? 4u : 8u;
+    const size_t motionBpp = motionRG16 ? 4u : 8u;
+
     const UINT RW = static_cast<UINT>(rw), RH = static_cast<UINT>(rh);
     const UINT TW = (tw > 0) ? static_cast<UINT>(tw) : RW;
     const UINT TH = (th > 0) ? static_cast<UINT>(th) : RH;
@@ -3438,36 +3481,72 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
 
         sprintf_s(path, sizeof(path), "%s\\frame_%06d\\color.bin", root.c_str(), i);
         std::string cbin = ReadFileAll(path, &fok);
-        if (!fok || cbin.size() < static_cast<size_t>(RW) * RH * 8)
+        if (!fok || cbin.size() < static_cast<size_t>(RW) * RH * colorBpp)
         { Log("[host] --capture: frame %d has no usable color.bin", i); break; }
 
         sprintf_s(path, sizeof(path), "%s\\frame_%06d\\motion.bin", root.c_str(), i);
         std::string mbin = ReadFileAll(path, &fok);
-        if (!fok || mbin.size() < static_cast<size_t>(RW) * RH * 8)
+        if (!fok || mbin.size() < static_cast<size_t>(RW) * RH * motionBpp)
         { Log("[host] --capture: frame %d has no usable motion.bin", i); break; }
 
-        // colour: RGBA16F HDR -> RGBA8 SDR
-        const uint16_t *cs = reinterpret_cast<const uint16_t *>(cbin.data());
-        for (size_t p = 0, n = static_cast<size_t>(RW) * RH; p < n; ++p)
+        // colour: on-disk HDR -> RGBA8 SDR (Reinhard unless --no-tone-map)
+        const size_t npix = static_cast<size_t>(RW) * RH;
+        if (colorR11)
         {
-            uint8_t *o = &colorRGBA8[p * 4];
-            for (int c = 0; c < 3; ++c)
+            const uint32_t *cs = reinterpret_cast<const uint32_t *>(cbin.data());
+            for (size_t p = 0; p < npix; ++p)
             {
-                float v = hl[cs[p * 4 + c]];
-                if (v < 0.0f) v = 0.0f;
-                const float t = no_tonemap ? (v > 1.0f ? 1.0f : v) : (v / (1.0f + v));
-                o[c] = gl[static_cast<int>(t * 1023.0f)];
+                float rgb[3];
+                UnpackR11G11B10(cs[p], rgb);
+                uint8_t *o = &colorRGBA8[p * 4];
+                for (int c = 0; c < 3; ++c)
+                {
+                    float v = rgb[c];
+                    if (v < 0.0f) v = 0.0f;
+                    const float t = no_tonemap ? (v > 1.0f ? 1.0f : v) : (v / (1.0f + v));
+                    o[c] = gl[static_cast<int>(t * 1023.0f)];
+                }
+                o[3] = 0xFF;
             }
-            o[3] = 0xFF;
         }
-        // motion: RGBA16F -> RG16F is a straight half copy of R and G
-        const uint16_t *msrc = reinterpret_cast<const uint16_t *>(mbin.data());
-        for (size_t p = 0, n = static_cast<size_t>(RW) * RH; p < n; ++p)
+        else
         {
-            uint16_t x = msrc[p * 4 + 0], y = msrc[p * 4 + 1];
-            if (flip_motion) { x = static_cast<uint16_t>(x ^ 0x8000u); y = static_cast<uint16_t>(y ^ 0x8000u); }
-            motionRG[p * 2 + 0] = x;
-            motionRG[p * 2 + 1] = y;
+            const uint16_t *cs = reinterpret_cast<const uint16_t *>(cbin.data());
+            for (size_t p = 0; p < npix; ++p)
+            {
+                uint8_t *o = &colorRGBA8[p * 4];
+                for (int c = 0; c < 3; ++c)
+                {
+                    float v = hl[cs[p * 4 + c]];
+                    if (v < 0.0f) v = 0.0f;
+                    const float t = no_tonemap ? (v > 1.0f ? 1.0f : v) : (v / (1.0f + v));
+                    o[c] = gl[static_cast<int>(t * 1023.0f)];
+                }
+                o[3] = 0xFF;
+            }
+        }
+        // motion: RG16F is already two halfs; RGBA16F is a straight half copy of R and G
+        if (motionRG16)
+        {
+            const uint16_t *msrc = reinterpret_cast<const uint16_t *>(mbin.data());
+            for (size_t p = 0; p < npix; ++p)
+            {
+                uint16_t x = msrc[p * 2 + 0], y = msrc[p * 2 + 1];
+                if (flip_motion) { x = static_cast<uint16_t>(x ^ 0x8000u); y = static_cast<uint16_t>(y ^ 0x8000u); }
+                motionRG[p * 2 + 0] = x;
+                motionRG[p * 2 + 1] = y;
+            }
+        }
+        else
+        {
+            const uint16_t *msrc = reinterpret_cast<const uint16_t *>(mbin.data());
+            for (size_t p = 0; p < npix; ++p)
+            {
+                uint16_t x = msrc[p * 4 + 0], y = msrc[p * 4 + 1];
+                if (flip_motion) { x = static_cast<uint16_t>(x ^ 0x8000u); y = static_cast<uint16_t>(y ^ 0x8000u); }
+                motionRG[p * 2 + 0] = x;
+                motionRG[p * 2 + 1] = y;
+            }
         }
 
         if (!CapUpload(color, up, upm, upPitch, colorRGBA8.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R8G8B8A8_UNORM) ||
