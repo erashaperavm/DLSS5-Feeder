@@ -11,6 +11,9 @@
 // duplicates the handles in. See src/feed_ipc.h.
 //
 //   dlss5-feed-host64.exe --test   stand-alone: synthetic pattern, no game needed
+//   dlss5-feed-host64.exe --capture <session dir> --out <dir> [--fps N] [--max-frames N]
+//                                  [--flip-motion] [--no-tone-map]
+//                                  replay a captured OptiScaler session from disk (no game needed)
 //                                  (phase-1 proof: "feature 18 created" in ReShade.log)
 //   dlss5-feed-host64.exe <pid>    serve the game with that PID over the pipe
 //
@@ -3042,6 +3045,446 @@ static int RunTest()
 }
 
 // ---------------------------------------------------------------------------
+// --capture: replay a capture session from disk through the same stack
+//
+// The 32-bit OptiScaler capture layer writes frame_%06d/{color,motion}.bin plus a
+// frame.json per frame; this mode feeds those through the identical
+// CreateFeature/Evaluate path --test proves, and writes the model's output to
+// 24-bit BMPs. Same device, same formats as --test on purpose: RGBA8 colour
+// (the HDR source is tone-mapped on the CPU), RG16F motion, RGBA8 output.
+// ---------------------------------------------------------------------------
+
+#include <math.h>
+
+static std::string ReadFileAll(const char *path, bool *ok)
+{
+    if (ok != nullptr) *ok = false;
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return std::string();
+    fseek(f, 0, SEEK_END);
+    const long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    std::string s;
+    if (n > 0)
+    {
+        s.resize(static_cast<size_t>(n));
+        const size_t got = fread(&s[0], 1, static_cast<size_t>(n), f);
+        s.resize(got);
+    }
+    fclose(f);
+    if (ok != nullptr) *ok = true;
+    return s;
+}
+
+// The capture metadata is a flat JSON object, so a key search is enough -- this
+// process has no JSON parser and should not grow one for six numbers.
+static bool JsonFind(const char *text, const char *key, const char **out)
+{
+    const std::string pat = std::string("\"") + key + "\"";
+    const char *p = strstr(text, pat.c_str());
+    if (p == nullptr) return false;
+    p += pat.size();
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    if (*p != ':') return false;
+    ++p;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+    *out = p;
+    return true;
+}
+
+static bool JsonNum(const char *text, const char *key, double *out)
+{
+    const char *v = nullptr;
+    if (!JsonFind(text, key, &v)) return false;
+    char *end = nullptr;
+    const double d = strtod(v, &end);
+    if (end == v) return false;
+    *out = d;
+    return true;
+}
+
+static bool JsonBool(const char *text, const char *key, bool *out)
+{
+    const char *v = nullptr;
+    if (!JsonFind(text, key, &v)) return false;
+    if (strncmp(v, "true", 4) == 0) { *out = true; return true; }
+    if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+// IEEE 754 binary16 -> float, as a table built once (the capture is all half floats).
+static const float *HalfLut()
+{
+    static float lut[65536];
+    static bool built = false;
+    if (!built)
+    {
+        built = true;
+        for (int i = 0; i < 65536; ++i)
+        {
+            const int s = (i >> 15) & 1;
+            const int e = (i >> 10) & 0x1F;
+            const int m = i & 0x3FF;
+            float v;
+            if (e == 0)       v = static_cast<float>(m) * 5.9604644775390625e-08f;   // 2^-24
+            else if (e == 31) v = (m == 0) ? 3.0e38f : 0.0f;                        // inf / NaN -> clamp
+            else              v = (1.0f + static_cast<float>(m) / 1024.0f) * powf(2.0f, static_cast<float>(e - 15));
+            lut[i] = s ? -v : v;
+        }
+    }
+    return lut;
+}
+
+static const uint8_t *GammaLut()
+{
+    static uint8_t lut[1024];
+    static bool built = false;
+    if (!built)
+    {
+        built = true;
+        for (int i = 0; i < 1024; ++i)
+            lut[i] = static_cast<uint8_t>(powf(static_cast<float>(i) / 1023.0f, 1.0f / 2.2f) * 255.0f + 0.5f);
+    }
+    return lut;
+}
+
+// 24-bit BMP, bottom-up BGR: the frames must open by double-click on any Windows
+// box, and this process deliberately carries no PNG encoder.
+static bool WriteBMP24(const char *path, const uint8_t *rgba, UINT w, UINT hh, UINT srcPitch)
+{
+    const UINT row = ((w * 3u) + 3u) & ~3u;
+    const UINT data = row * hh;
+
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "wb") != 0 || f == nullptr) return false;
+
+    uint8_t  hdr[54] = {};
+    const uint32_t file_size = 54u + data, off = 54u, ih = 40u;
+    const int32_t  iw = static_cast<int32_t>(w), ihh = static_cast<int32_t>(hh);
+    const uint16_t planes = 1, bpp = 24;
+    hdr[0] = 'B'; hdr[1] = 'M';
+    memcpy(hdr + 2,  &file_size, 4);
+    memcpy(hdr + 10, &off, 4);
+    memcpy(hdr + 14, &ih, 4);
+    memcpy(hdr + 18, &iw, 4);
+    memcpy(hdr + 22, &ihh, 4);
+    memcpy(hdr + 26, &planes, 2);
+    memcpy(hdr + 28, &bpp, 2);
+    memcpy(hdr + 34, &data, 4);
+    fwrite(hdr, 1, 54, f);
+
+    std::vector<uint8_t> line(row, 0);
+    for (int y = static_cast<int>(hh) - 1; y >= 0; --y)
+    {
+        const uint8_t *s = rgba + static_cast<size_t>(y) * srcPitch;
+        for (UINT x = 0; x < w; ++x)
+        {
+            line[x * 3 + 0] = s[x * 4 + 2];
+            line[x * 3 + 1] = s[x * 4 + 1];
+            line[x * 3 + 2] = s[x * 4 + 0];
+        }
+        fwrite(line.data(), 1, row, f);
+    }
+    fclose(f);
+    return true;
+}
+
+// COMMON -> COPY_DEST -> copy -> COMMON, one submission. COMMON is a legal
+// StateBefore for anything, and a finished submission decays back to it, so the
+// evaluate's own barrier bookkeeping (OptiBarriers, which assumes COMMON) is
+// unaffected by the frames we stage in between.
+static bool CapUpload(ID3D12Resource *dst, ID3D12Resource *staging, uint8_t *mapped, UINT pitch,
+                      const void *src, UINT w, UINT hh, UINT srcRowBytes, UINT bpp, DXGI_FORMAT fmt)
+{
+    for (UINT y = 0; y < hh; ++y)
+        memcpy(mapped + static_cast<size_t>(y) * pitch,
+               static_cast<const uint8_t *>(src) + static_cast<size_t>(y) * srcRowBytes,
+               static_cast<size_t>(w) * bpp);
+
+    if (!BeginCommands()) return false;
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = dst;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+    h.list->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION s = {}, d = {};
+    s.pResource = staging;
+    s.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    s.PlacedFootprint.Footprint.Format   = fmt;
+    s.PlacedFootprint.Footprint.Width    = w;
+    s.PlacedFootprint.Footprint.Height   = hh;
+    s.PlacedFootprint.Footprint.Depth    = 1;
+    s.PlacedFootprint.Footprint.RowPitch = pitch;
+    d.pResource = dst;
+    d.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    h.list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    h.list->ResourceBarrier(1, &b);
+
+    const UINT64 v = EndCommands();
+    return WaitFenceValue(h.fence, v, 10000);
+}
+
+// The model's output back to the CPU. The evaluate leaves the output in COMMON
+// (either OptiBarriers put it there explicitly, or the driver decayed it), so the
+// transition in claims COMMON and gives COMMON back for the next frame.
+static bool CapReadback(ID3D12Resource *out, ID3D12Resource *rb, UINT pitch, UINT w, UINT hh,
+                        DXGI_FORMAT fmt, uint8_t **mapped)
+{
+    *mapped = nullptr;
+    if (!BeginCommands()) return false;
+
+    D3D12_RESOURCE_BARRIER b = {};
+    b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource   = out;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    h.list->ResourceBarrier(1, &b);
+
+    D3D12_TEXTURE_COPY_LOCATION s = {}, d = {};
+    s.pResource = out;
+    s.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    d.pResource = rb;
+    d.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    d.PlacedFootprint.Footprint.Format   = fmt;
+    d.PlacedFootprint.Footprint.Width    = w;
+    d.PlacedFootprint.Footprint.Height   = hh;
+    d.PlacedFootprint.Footprint.Depth    = 1;
+    d.PlacedFootprint.Footprint.RowPitch = pitch;
+    h.list->CopyTextureRegion(&d, 0, 0, 0, &s, nullptr);
+
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+    h.list->ResourceBarrier(1, &b);
+
+    const UINT64 v = EndCommands();
+    if (!WaitFenceValue(h.fence, v, 20000)) return false;
+
+    D3D12_RANGE r = { 0, static_cast<size_t>(pitch) * hh };
+    if (FAILED(rb->Map(0, &r, reinterpret_cast<void **>(mapped))) || *mapped == nullptr) return false;
+    return true;
+}
+
+static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
+                      bool flip_motion, bool no_tonemap, int max_frames)
+{
+    std::string root = (cap_dir != nullptr) ? cap_dir : "";
+    while (!root.empty() && (root.back() == '\\' || root.back() == '/')) root.pop_back();
+    if (root.empty()) { Log("[host] --capture needs a session directory"); return 1; }
+
+    std::string outd = (out_dir != nullptr && out_dir[0] != '\0') ? out_dir : "dlss5_out";
+    CreateDirectoryA(outd.c_str(), nullptr);
+
+    char path[1024];
+
+    // ---- geometry and flags, from the first frame ----
+    sprintf_s(path, sizeof(path), "%s\\frame_000000\\frame.json", root.c_str());
+    bool ok = false;
+    std::string fj = ReadFileAll(path, &ok);
+    if (!ok) { Log("[host] --capture: cannot read %s", path); return 1; }
+
+    double rw = 0, rh = 0, tw = 0, th = 0, msx = 1.0, msy = 1.0;
+    bool low_res = false, depth_inv = false, auto_exp = false, is_hdr = false;
+    JsonNum(fj.c_str(), "render_width", &rw);
+    JsonNum(fj.c_str(), "render_height", &rh);
+    JsonNum(fj.c_str(), "target_width", &tw);
+    JsonNum(fj.c_str(), "target_height", &th);
+    JsonNum(fj.c_str(), "motion_scale_x", &msx);
+    JsonNum(fj.c_str(), "motion_scale_y", &msy);
+    JsonBool(fj.c_str(), "low_res_mv", &low_res);
+    JsonBool(fj.c_str(), "depth_inverted", &depth_inv);
+    JsonBool(fj.c_str(), "auto_exposure", &auto_exp);
+    JsonBool(fj.c_str(), "is_hdr", &is_hdr);
+    if (rw <= 0 || rh <= 0) { Log("[host] --capture: frame.json has no render_width/height"); return 1; }
+
+    const UINT RW = static_cast<UINT>(rw), RH = static_cast<UINT>(rh);
+    const UINT TW = (tw > 0) ? static_cast<UINT>(tw) : RW;
+    const UINT TH = (th > 0) ? static_cast<UINT>(th) : RH;
+
+    int flags = 0;
+    if (low_res)   flags |= NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
+    if (depth_inv) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
+    if (auto_exp)  flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+
+    Log("[host] --capture: %s -> %s", root.c_str(), outd.c_str());
+    Log("[host] --capture: render %ux%u -> target %ux%u, motion scale (%.4f, %.4f) "
+        "hdr=%d low_res_mv=%d depth_inverted=%d auto_exposure=%d flags=0x%X",
+        RW, RH, TW, TH, msx, msy, is_hdr ? 1 : 0, low_res ? 1 : 0, depth_inv ? 1 : 0, auto_exp ? 1 : 0, flags);
+    if (is_hdr && !no_tonemap)
+        Log("[host] --capture: HDR source; colour is Reinhard tone-mapped to SDR RGBA8 on the CPU");
+
+    // ---- textures: exactly the formats --test proved on this device ----
+    ID3D12Resource *color  = MakeTex(RW, RH, DXGI_FORMAT_R8G8B8A8_UNORM, false);
+    ID3D12Resource *output = MakeTex(TW, TH, DXGI_FORMAT_R8G8B8A8_UNORM, true);
+    ID3D12Resource *depth  = MakeTex(RW, RH, DXGI_FORMAT_R32_FLOAT, false);
+    ID3D12Resource *mv     = MakeTex(RW, RH, DXGI_FORMAT_R16G16_FLOAT, false);
+    if (color == nullptr || output == nullptr || depth == nullptr || mv == nullptr)
+    { Log("[host] --capture: texture creation failed"); return 1; }
+
+    // ---- staging + readback ----
+    const UINT upPitch = ((RW * 4u) + 255u) & ~255u;
+    const UINT rbPitch = ((TW * 4u) + 255u) & ~255u;
+
+    D3D12_HEAP_PROPERTIES hpu = {};
+    hpu.Type = D3D12_HEAP_TYPE_UPLOAD;
+    D3D12_RESOURCE_DESC bdu = {};
+    bdu.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bdu.Width            = static_cast<UINT64>(upPitch) * RH;
+    bdu.Height           = 1;
+    bdu.DepthOrArraySize = 1;
+    bdu.MipLevels        = 1;
+    bdu.SampleDesc.Count = 1;
+    bdu.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource *up = nullptr;
+    if (FAILED(h.dev->CreateCommittedResource(&hpu, D3D12_HEAP_FLAG_NONE, &bdu,
+             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, __uuidof(ID3D12Resource),
+             reinterpret_cast<void **>(&up))) || up == nullptr)
+    { Log("[host] --capture: upload buffer failed"); return 1; }
+
+    D3D12_HEAP_PROPERTIES hpr = {};
+    hpr.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bdr = bdu;
+    bdr.Width = static_cast<UINT64>(rbPitch) * TH;
+    ID3D12Resource *rb = nullptr;
+    if (FAILED(h.dev->CreateCommittedResource(&hpr, D3D12_HEAP_FLAG_NONE, &bdr,
+             D3D12_RESOURCE_STATE_COPY_DEST, nullptr, __uuidof(ID3D12Resource),
+             reinterpret_cast<void **>(&rb))) || rb == nullptr)
+    { Log("[host] --capture: readback buffer failed"); return 1; }
+
+    uint8_t *upm = nullptr;
+    if (FAILED(up->Map(0, nullptr, reinterpret_cast<void **>(&upm))) || upm == nullptr)
+    { Log("[host] --capture: upload map failed"); return 1; }
+
+    // ---- per-frame scratch, reused ----
+    std::vector<uint8_t>  colorRGBA8(static_cast<size_t>(RW) * RH * 4);
+    std::vector<uint16_t> motionRG(static_cast<size_t>(RW) * RH * 2);
+    std::vector<float>    depthPlane(static_cast<size_t>(RW) * RH, 1.0f);
+
+    // The same hook-arming time --test gives the DLSS 5 add-on, swapchain pumping.
+    for (int i = 0; i < 120; ++i) { PumpPresent(true); Sleep(8); }
+
+    NVSDK_NGX_Result rf = NVSDK_NGX_Result_Fail;
+    if (!CreateFeature(RW, RH, flags, &rf, TW, TH))
+    { Log("[host] --capture: CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf)); return 1; }
+
+    // The session captured no depth (CaptureDepth=false) and the model still wants
+    // one, so feed a constant plane: the answer is about colour and motion here.
+    if (!CapUpload(depth, up, upm, upPitch, depthPlane.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R32_FLOAT))
+    { Log("[host] --capture: depth upload failed"); return 1; }
+    Log("[host] --capture: depth is a constant plane (the session captured none)");
+
+    const float   *hl = HalfLut();
+    const uint8_t *gl = GammaLut();
+
+    int written = 0;
+    for (int i = 0; i < max_frames; ++i)
+    {
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d\\frame.json", root.c_str(), i);
+        bool fok = false;
+        std::string fjf = ReadFileAll(path, &fok);
+        if (!fok) { Log("[host] --capture: frame %d stops here (no frame.json)", i); break; }
+
+        double jx = 0, jy = 0, fmx = msx, fmy = msy;
+        JsonNum(fjf.c_str(), "jitter_x", &jx);
+        JsonNum(fjf.c_str(), "jitter_y", &jy);
+        JsonNum(fjf.c_str(), "motion_scale_x", &fmx);
+        JsonNum(fjf.c_str(), "motion_scale_y", &fmy);
+
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d\\color.bin", root.c_str(), i);
+        std::string cbin = ReadFileAll(path, &fok);
+        if (!fok || cbin.size() < static_cast<size_t>(RW) * RH * 8)
+        { Log("[host] --capture: frame %d has no usable color.bin", i); break; }
+
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d\\motion.bin", root.c_str(), i);
+        std::string mbin = ReadFileAll(path, &fok);
+        if (!fok || mbin.size() < static_cast<size_t>(RW) * RH * 8)
+        { Log("[host] --capture: frame %d has no usable motion.bin", i); break; }
+
+        // colour: RGBA16F HDR -> RGBA8 SDR
+        const uint16_t *cs = reinterpret_cast<const uint16_t *>(cbin.data());
+        for (size_t p = 0, n = static_cast<size_t>(RW) * RH; p < n; ++p)
+        {
+            uint8_t *o = &colorRGBA8[p * 4];
+            for (int c = 0; c < 3; ++c)
+            {
+                float v = hl[cs[p * 4 + c]];
+                if (v < 0.0f) v = 0.0f;
+                const float t = no_tonemap ? (v > 1.0f ? 1.0f : v) : (v / (1.0f + v));
+                o[c] = gl[static_cast<int>(t * 1023.0f)];
+            }
+            o[3] = 0xFF;
+        }
+        // motion: RGBA16F -> RG16F is a straight half copy of R and G
+        const uint16_t *msrc = reinterpret_cast<const uint16_t *>(mbin.data());
+        for (size_t p = 0, n = static_cast<size_t>(RW) * RH; p < n; ++p)
+        {
+            uint16_t x = msrc[p * 4 + 0], y = msrc[p * 4 + 1];
+            if (flip_motion) { x = static_cast<uint16_t>(x ^ 0x8000u); y = static_cast<uint16_t>(y ^ 0x8000u); }
+            motionRG[p * 2 + 0] = x;
+            motionRG[p * 2 + 1] = y;
+        }
+
+        if (!CapUpload(color, up, upm, upPitch, colorRGBA8.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R8G8B8A8_UNORM) ||
+            !CapUpload(mv, up, upm, upPitch, motionRG.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R16G16_FLOAT))
+        { Log("[host] --capture: frame %d upload failed", i); break; }
+
+        PumpPresent(true);
+        if (!Evaluate(color, output, depth, mv, RW, RH, i == 0 ? 1 : 0,
+                      static_cast<float>(fmx), static_cast<float>(fmy),
+                      static_cast<float>(jx), static_cast<float>(jy), 0, 0.0f))
+        { Log("[host] --capture: frame %d evaluate failed", i); break; }
+
+        uint8_t *outp = nullptr;
+        if (!CapReadback(output, rb, rbPitch, TW, TH, DXGI_FORMAT_R8G8B8A8_UNORM, &outp))
+        { Log("[host] --capture: frame %d readback failed", i); break; }
+
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d.bmp", outd.c_str(), i);
+        if (!WriteBMP24(path, outp, TW, TH, rbPitch))
+        { Log("[host] --capture: cannot write %s", path); D3D12_RANGE none = { 0, 0 }; rb->Unmap(0, &none); break; }
+        D3D12_RANGE none = { 0, 0 };
+        rb->Unmap(0, &none);
+
+        ++written;
+        if (written == 1 || (written % 10) == 0)
+            Log("[host] --capture: %d frame(s) written (%ux%u)", written, TW, TH);
+    }
+
+    // result.json: the rate lives next to the frames so ffmpeg needs no memory of it
+    sprintf_s(path, sizeof(path), "%s\\result.json", outd.c_str());
+    FILE *rfj = nullptr;
+    if (fopen_s(&rfj, path, "w") == 0 && rfj != nullptr)
+    {
+        fprintf(rfj,
+                "{\n  \"frames\": %d,\n  \"fps\": %d,\n  \"width\": %u,\n  \"height\": %u,\n"
+                "  \"source\": \"%s\",\n  \"depth\": \"constant plane (none captured)\",\n"
+                "  \"flip_motion\": %s\n}\n",
+                written, fps, TW, TH, root.c_str(), flip_motion ? "true" : "false");
+        fclose(rfj);
+    }
+
+    Log("[host] --capture finished: %d frame(s) -> %s", written, outd.c_str());
+    if (written > 0)
+        Log("[host] --capture: ffmpeg -framerate %d -i frame_%%06d.bmp -c:v libx264 -crf 16 "
+            "-pix_fmt yuv420p dlss5_out.mp4", fps);
+
+    up->Unmap(0, nullptr);
+    up->Release();
+    rb->Release();
+    color->Release();
+    output->Release();
+    depth->Release();
+    mv->Release();
+    return written > 0 ? 0 : 1;
+}
+
+// ---------------------------------------------------------------------------
 // Serve mode: the real pipe server for a 32-bit game
 // ---------------------------------------------------------------------------
 
@@ -4044,6 +4487,10 @@ int main(int argc, char **argv)
     timeBeginPeriod(1);
 
     bool  test = false, hide = false, behind = false, gpu_priority = false;
+    // --capture: replay a captured session from disk instead of serving a game.
+    const char *cap_dir = nullptr, *cap_out = nullptr;
+    int  cap_fps = 30, cap_max = 0;
+    bool cap_flip = false, cap_notm = false;
     DWORD pid = 0;
     for (int i = 1; i < argc; ++i)
     {
@@ -4051,6 +4498,12 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
         else if (strcmp(argv[i], "--behind") == 0) behind = true;
         else if (strcmp(argv[i], "--gpu-priority") == 0) gpu_priority = true;
+        else if (strcmp(argv[i], "--capture") == 0 && i + 1 < argc) cap_dir = argv[++i];
+        else if (strcmp(argv[i], "--out") == 0 && i + 1 < argc) cap_out = argv[++i];
+        else if (strcmp(argv[i], "--fps") == 0 && i + 1 < argc) cap_fps = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) cap_max = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--flip-motion") == 0) cap_flip = true;
+        else if (strcmp(argv[i], "--no-tone-map") == 0) cap_notm = true;
         // First numeric token wins. This used to be a bare assignment, so ANY later token
         // the parser did not recognise ran through strtoul, came back 0, and silently
         // overwrote an already-parsed pid -- turning a good command line into the usage
@@ -4058,13 +4511,16 @@ int main(int argc, char **argv)
         else if (pid == 0 && (pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10))) != 0) {}
         else Log("[host] ignoring an argument I do not understand: %s", argv[i]);
     }
-    if (!test && pid == 0)
+    if (!test && cap_dir == nullptr && pid == 0)
     {
         Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind] "
             "[--gpu-priority]");
+        Log("       dlss5-feed-host64 --capture <session dir> --out <dir> [--fps N] [--max-frames N] "
+            "[--flip-motion] [--no-tone-map]");
         return 1;
     }
-    g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
+    // --capture is headless like --test: nothing to watch, the frames land on disk.
+    g_show_window = !(test || cap_dir != nullptr) && !hide;
     g_behind      = g_show_window && behind;
     if (gpu_priority) RaiseGpuSchedulingPriority();
 
@@ -4096,7 +4552,11 @@ int main(int argc, char **argv)
     else if (!InitNgx())
         Log("[host] NGX unavailable");
     else
-        rc = test ? RunTest() : Serve(pid);
+        rc = test ? RunTest()
+                  : (cap_dir != nullptr
+                         ? RunCapture(cap_dir, cap_out, cap_fps, cap_flip, cap_notm,
+                                      cap_max > 0 ? cap_max : (1 << 30))
+                         : Serve(pid));
 
     ShutdownDisguise();
     // Everything that had to happen has happened: ReShade wrote its ini when its runtime
