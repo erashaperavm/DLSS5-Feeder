@@ -3376,13 +3376,37 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
 
     // On-disk formats. The capture layer may compact (motion -> RG16F, colour -> R11G11B10F);
     // follow frame.json rather than assuming, so old (uncompacted) and new sessions both read.
+    // On-disk formats. The capture layer may compact (motion -> RG16F, colour -> R11G11B10F);
+    // follow frame.json rather than assuming, so old (uncompacted) and new sessions both read.
+    // Only the four formats below are decodable here. Anything else means the capture layer
+    // wrote a raw source format this build cannot interpret: fail fast with the format name
+    // instead of quietly misreading the bytes (a wrong stride that still passes the size check
+    // would yield garbage motion vectors with no error at all).
     std::string colorFmt, motionFmt;
     JsonStr(fj.c_str(), "color_format", &colorFmt);
     JsonStr(fj.c_str(), "motion_format", &motionFmt);
     if (colorFmt.empty())  colorFmt  = "DXGI_FORMAT_R16G16B16A16_FLOAT";
     if (motionFmt.empty()) motionFmt = "DXGI_FORMAT_R16G16B16A16_FLOAT";
-    const bool colorR11   = (colorFmt  == "DXGI_FORMAT_R11G11B10_FLOAT");
-    const bool motionRG16 = (motionFmt == "DXGI_FORMAT_R16G16_FLOAT");
+
+    const bool colorRGBA16  = (colorFmt  == "DXGI_FORMAT_R16G16B16A16_FLOAT");
+    const bool colorR11     = (colorFmt  == "DXGI_FORMAT_R11G11B10_FLOAT");
+    const bool motionRGBA16 = (motionFmt == "DXGI_FORMAT_R16G16B16A16_FLOAT");
+    const bool motionRG16   = (motionFmt == "DXGI_FORMAT_R16G16_FLOAT");
+
+    if (!colorRGBA16 && !colorR11)
+    {
+        Log("[host] --capture: unsupported on-disk colour format %s (this build decodes "
+            "R16G16B16A16_FLOAT and R11G11B10_FLOAT only). Re-capture with [Capture] Compact=true, "
+            "or use a host built for this format.", colorFmt.c_str());
+        return 1;
+    }
+    if (!motionRGBA16 && !motionRG16)
+    {
+        Log("[host] --capture: unsupported on-disk motion format %s (this build decodes "
+            "R16G16B16A16_FLOAT and R16G16_FLOAT only).", motionFmt.c_str());
+        return 1;
+    }
+
     const size_t colorBpp  = colorR11   ? 4u : 8u;
     const size_t motionBpp = motionRG16 ? 4u : 8u;
 
@@ -3399,6 +3423,9 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     Log("[host] --capture: render %ux%u -> target %ux%u, motion scale (%.4f, %.4f) "
         "hdr=%d low_res_mv=%d depth_inverted=%d auto_exposure=%d flags=0x%X",
         RW, RH, TW, TH, msx, msy, is_hdr ? 1 : 0, low_res ? 1 : 0, depth_inv ? 1 : 0, auto_exp ? 1 : 0, flags);
+    Log("[host] --capture: on-disk colour %s (%u B/px), motion %s (%u B/px)",
+        colorFmt.c_str(), static_cast<unsigned>(colorBpp),
+        motionFmt.c_str(), static_cast<unsigned>(motionBpp));
     if (is_hdr && !no_tonemap)
         Log("[host] --capture: HDR source; colour is Reinhard tone-mapped to SDR RGBA8 on the CPU");
 
