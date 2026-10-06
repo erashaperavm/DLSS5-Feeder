@@ -3865,24 +3865,53 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
 
     // The capture layer records the system/game audio into the session dir (audio.wav); bring it
     // along so the ffmpeg command below can mux it without the user hunting for the session path.
+    //
+    // Validate the RIFF header on the way through. A session can leave behind an audio.wav whose
+    // header never got its RIFF/data lengths backfilled (the capture thread was killed before the
+    // rewrite), and handing that to ffmpeg turns into a confusing "wav header size < 14" error
+    // well after the capture finished. Report it here instead, and drop the audio from the
+    // suggested command so the plain video composite still works.
     bool haveAudio = false;
     {
         sprintf_s(path, sizeof(path), "%s\\audio.wav", root.c_str());
         FILE *asrc = nullptr;
         if (fopen_s(&asrc, path, "rb") == 0 && asrc != nullptr)
         {
-            sprintf_s(path, sizeof(path), "%s\\audio.wav", outd.c_str());
-            FILE *adst = nullptr;
-            if (fopen_s(&adst, path, "wb") == 0 && adst != nullptr)
+            uint8_t ah[44] = {};
+            const size_t got = fread(ah, 1, sizeof(ah), asrc);
+            const bool riff = got == sizeof(ah) && memcmp(ah, "RIFF", 4) == 0 &&
+                              memcmp(ah + 8, "WAVE", 4) == 0 && memcmp(ah + 12, "fmt ", 4) == 0 &&
+                              memcmp(ah + 36, "data", 4) == 0;
+            uint32_t declared = 0;
+            if (riff)
+                memcpy(&declared, ah + 40, 4);
+
+            if (!riff || declared == 0)
             {
-                char abuf[64 * 1024];
-                size_t an = 0;
-                while ((an = fread(abuf, 1, sizeof(abuf), asrc)) > 0)
-                    fwrite(abuf, 1, an, adst);
-                fclose(adst);
-                haveAudio = true;
+                fseek(asrc, 0, SEEK_END);
+                const long sz = ftell(asrc);
+                Log("[host] --capture: audio.wav looks unusable (%ld bytes, %s); leaving it out of "
+                    "the composite. Re-record, or feed ffmpeg the raw stream with an explicit "
+                    "-f f32le/-f s16le and -skip_initial_bytes.",
+                    sz, riff ? "data length is 0 (header never backfilled)" : "no RIFF/WAVE header");
+                fclose(asrc);
             }
-            fclose(asrc);
+            else
+            {
+                rewind(asrc);
+                sprintf_s(path, sizeof(path), "%s\\audio.wav", outd.c_str());
+                FILE *adst = nullptr;
+                if (fopen_s(&adst, path, "wb") == 0 && adst != nullptr)
+                {
+                    char abuf[64 * 1024];
+                    size_t an = 0;
+                    while ((an = fread(abuf, 1, sizeof(abuf), asrc)) > 0)
+                        fwrite(abuf, 1, an, adst);
+                    fclose(adst);
+                    haveAudio = true;
+                }
+                fclose(asrc);
+            }
         }
     }
 
