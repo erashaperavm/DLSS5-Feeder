@@ -3229,10 +3229,18 @@ static bool WritePNG24(const char *path, const uint8_t *rgba, UINT w, UINT hh, U
     // this is a short-lived offline tool, so the matching CoUninitialize is deliberately skipped.
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    IWICImagingFactory *factory = nullptr;
-    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                  IID_PPV_ARGS(&factory));
-    if (FAILED(hr) || factory == nullptr) return false;
+    // IWICImagingFactory2, not IWICImagingFactory: CreateStream is a 2.0 method. Asking for 1.0
+    // and calling it anyway dispatches the wrong vtable slot -- with a null destination out-param
+    // that lands as an access violation writing address 0. The riid is spelled out rather than
+    // taken from IID_PPV_ARGS so the interface and the request cannot drift apart.
+    IWICImagingFactory2 *factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER,
+                                  __uuidof(IWICImagingFactory2), reinterpret_cast<void **>(&factory));
+    if (FAILED(hr) || factory == nullptr)
+    {
+        Log("[host] --capture: WIC imaging factory 2 unavailable (hr=0x%08X); cannot encode PNG", hr);
+        return false;
+    }
 
     const UINT stride = w * 3u;
     std::vector<uint8_t> bgr(static_cast<size_t>(stride) * hh, 0);
