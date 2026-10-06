@@ -3638,6 +3638,11 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
 
         // colour: on-disk -> the RGBA8 the model is fed
         const size_t npix = static_cast<size_t>(RW) * RH;
+        // Every branch below writes all four bytes of colorRGBA8[p*4], so it must always be the
+        // full frame. Make that explicit rather than relying on a prior iteration's capacity:
+        // an empty vector here is a write through a null pointer, which is exactly the crash
+        // this replaced (prevColor.swap had drained it).
+        colorRGBA8.resize(npix * 4u);
         if (colorRGB8)
         {
             // The capture layer already applied Reinhard + gamma when it wrote 8-bit RGB, so
@@ -3711,7 +3716,12 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         }
 
         // ---- motion-direction probe: does +MV or -MV align the previous frame to this one? ----
-        if (!prevColor.empty())
+        // prevColor holds RGBA8 (4 B/px) -- the same layout colorRGBA8 has -- and is only ever
+        // read once it has been filled by a previous iteration. The size guard is explicit
+        // because the probe indexes both buffers at *4; a short or null buffer here would be an
+        // out-of-bounds read, not a graceful skip.
+        if (prevColor.size() == static_cast<size_t>(RW) * RH * 4u &&
+            colorRGBA8.size() >= static_cast<size_t>(RW) * RH * 4u)
         {
             double ax = 0.0, ay = 0.0;
             long ac = 0;
@@ -3782,7 +3792,10 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         if (written == 1 || (written % 10) == 0)
             Log("[host] --capture: %d frame(s) written (%ux%u)", written, TW, TH);
 
-        prevColor.swap(colorRGBA8);   // this frame becomes the probe's "previous"
+        // Keep a copy for the probe. This must NOT be a swap: swapping would leave colorRGBA8
+        // empty for the next iteration, and every colour branch indexes it at &colorRGBA8[p*4] --
+        // on an empty vector that is a write through a null pointer, not a capacity problem.
+        prevColor = colorRGBA8;
     }
 
     // ---- motion-direction verdict ----
