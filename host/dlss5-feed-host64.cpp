@@ -12,7 +12,7 @@
 //
 //   dlss5-feed-host64.exe --test   stand-alone: synthetic pattern, no game needed
 //   dlss5-feed-host64.exe --capture <session dir> --out <dir> [--fps N] [--max-frames N]
-//                                  [--flip-motion] [--no-tone-map]
+//                                  [--flip-motion] [--no-tone-map] [--no-mv-stride]
 //                                  replay a captured OptiScaler session from disk (no game needed)
 //                                  (phase-1 proof: "feature 18 created" in ReShade.log)
 //   dlss5-feed-host64.exe <pid>    serve the game with that PID over the pipe
@@ -27,6 +27,8 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>   // pD3DCompile only; the function itself comes from d3dcompiler_47 by name
+#include <objbase.h>       // CoCreateInstance / CoInitializeEx, for the WIC PNG encoder below
+#include <wincodec.h>      // WIC: the OS ships a real (zlib) PNG encoder, so no vendored codec
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
@@ -3088,9 +3090,9 @@ static int RunTest()
 //
 // The 32-bit OptiScaler capture layer writes frame_%06d/{color,motion}.bin plus a
 // frame.json per frame; this mode feeds those through the identical
-// CreateFeature/Evaluate path --test proves, and writes the model's output to
-// 24-bit BMPs. Same device, same formats as --test on purpose: RGBA8 colour
-// (the HDR source is tone-mapped on the CPU), RG16F motion, RGBA8 output.
+// CreateFeature/Evaluate path --test proves, and writes the model's output to 24-bit PNGs
+// (via WIC — roughly 2-3x smaller than the uncompressed BMP this used to write). Same device,
+// same formats as --test on purpose: RGBA8 colour, RG16F motion, RGBA8 output.
 // ---------------------------------------------------------------------------
 
 #include <math.h>
@@ -3218,45 +3220,65 @@ static void UnpackR11G11B10(uint32_t p, float out[3])
     }
 }
 
-// 24-bit BMP, bottom-up BGR: the frames must open by double-click on any Windows
-// box, and this process deliberately carries no PNG encoder.
-static bool WriteBMP24(const char *path, const uint8_t *rgba, UINT w, UINT hh, UINT srcPitch)
+// 24-bit PNG via WIC: lossless, opens by double-click on any Windows box like the BMP it
+// replaced, and the OS supplies the zlib encoder so this process still vendors no codec.
+// Typical frames come out 1.5-3x smaller than the equivalent uncompressed BMP (content-dependent).
+static bool WritePNG24(const char *path, const uint8_t *rgba, UINT w, UINT hh, UINT srcPitch)
 {
-    const UINT row = ((w * 3u) + 3u) & ~3u;
-    const UINT data = row * hh;
+    // WIC needs COM on this thread. S_FALSE / RPC_E_CHANGED_MODE both mean it already is, and
+    // this is a short-lived offline tool, so the matching CoUninitialize is deliberately skipped.
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    FILE *f = nullptr;
-    if (fopen_s(&f, path, "wb") != 0 || f == nullptr) return false;
+    IWICImagingFactory *factory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                  IID_PPV_ARGS(&factory));
+    if (FAILED(hr) || factory == nullptr) return false;
 
-    uint8_t  hdr[54] = {};
-    const uint32_t file_size = 54u + data, off = 54u, ih = 40u;
-    const int32_t  iw = static_cast<int32_t>(w), ihh = static_cast<int32_t>(hh);
-    const uint16_t planes = 1, bpp = 24;
-    hdr[0] = 'B'; hdr[1] = 'M';
-    memcpy(hdr + 2,  &file_size, 4);
-    memcpy(hdr + 10, &off, 4);
-    memcpy(hdr + 14, &ih, 4);
-    memcpy(hdr + 18, &iw, 4);
-    memcpy(hdr + 22, &ihh, 4);
-    memcpy(hdr + 26, &planes, 2);
-    memcpy(hdr + 28, &bpp, 2);
-    memcpy(hdr + 34, &data, 4);
-    fwrite(hdr, 1, 54, f);
-
-    std::vector<uint8_t> line(row, 0);
-    for (int y = static_cast<int>(hh) - 1; y >= 0; --y)
+    const UINT stride = w * 3u;
+    std::vector<uint8_t> bgr(static_cast<size_t>(stride) * hh, 0);
+    for (UINT y = 0; y < hh; ++y)
     {
         const uint8_t *s = rgba + static_cast<size_t>(y) * srcPitch;
+        uint8_t *d = bgr.data() + static_cast<size_t>(y) * stride;
         for (UINT x = 0; x < w; ++x)
         {
-            line[x * 3 + 0] = s[x * 4 + 2];
-            line[x * 3 + 1] = s[x * 4 + 1];
-            line[x * 3 + 2] = s[x * 4 + 0];
+            d[x * 3 + 0] = s[x * 4 + 2]; // WIC's 24bppBGR is B,G,R in memory
+            d[x * 3 + 1] = s[x * 4 + 1];
+            d[x * 3 + 2] = s[x * 4 + 0];
         }
-        fwrite(line.data(), 1, row, f);
     }
-    fclose(f);
-    return true;
+
+    wchar_t wpath[MAX_PATH] = {};
+    if (MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, MAX_PATH) == 0)
+        MultiByteToWideChar(CP_ACP, 0, path, -1, wpath, MAX_PATH);
+
+    IWICStream *stream = nullptr;
+    IWICBitmapEncoder *enc = nullptr;
+    IWICBitmapFrameEncode *frame = nullptr;
+    bool ok = false;
+
+    if (SUCCEEDED(factory->CreateStream(&stream)) && stream != nullptr &&
+        SUCCEEDED(stream->InitializeFromFilename(wpath, GENERIC_WRITE)) &&
+        SUCCEEDED(factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) && enc != nullptr &&
+        SUCCEEDED(enc->Initialize(stream, WICBitmapEncoderNoCache)) &&
+        SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && frame != nullptr &&
+        SUCCEEDED(frame->Initialize(nullptr)) &&
+        SUCCEEDED(frame->SetSize(w, hh)))
+    {
+        WICPixelFormatGUID pf = GUID_WICPixelFormat24bppBGR;
+        if (SUCCEEDED(frame->SetPixelFormat(&pf)) && IsEqualGUID(pf, GUID_WICPixelFormat24bppBGR) &&
+            SUCCEEDED(frame->WritePixels(hh, stride, static_cast<UINT>(bgr.size()), bgr.data())) &&
+            SUCCEEDED(frame->Commit()) && SUCCEEDED(enc->Commit()))
+        {
+            ok = true;
+        }
+    }
+
+    if (frame != nullptr) frame->Release();
+    if (enc != nullptr) enc->Release();
+    if (stream != nullptr) stream->Release();
+    factory->Release();
+    return ok;
 }
 
 // COMMON -> COPY_DEST -> copy -> COMMON, one submission. COMMON is a legal
@@ -3342,8 +3364,39 @@ static bool CapReadback(ID3D12Resource *out, ID3D12Resource *rb, UINT pitch, UIN
     return true;
 }
 
+static inline int IAbs(int v) { return v < 0 ? -v : v; }
+
+// Mean absolute colour difference between `cur` and `prev` sampled at prev(x+dx, y+dy).
+// Only the motion-direction probe uses this: whichever shift aligns the two frames better tells
+// us which sign the captured motion vectors are in.
+static double MadShifted(const std::vector<uint8_t> &cur, const std::vector<uint8_t> &prev, UINT w, UINT h,
+                         int dx, int dy)
+{
+    long long sum = 0;
+    long long n = 0;
+    for (int y = 0; y < static_cast<int>(h); y += 2)
+    {
+        const int py = y + dy;
+        if (py < 0 || py >= static_cast<int>(h))
+            continue;
+        for (int x = 0; x < static_cast<int>(w); x += 2)
+        {
+            const int px = x + dx;
+            if (px < 0 || px >= static_cast<int>(w))
+                continue;
+            const size_t a = (static_cast<size_t>(y) * w + static_cast<size_t>(x)) * 4;
+            const size_t b = (static_cast<size_t>(py) * w + static_cast<size_t>(px)) * 4;
+            sum += IAbs(static_cast<int>(cur[a]) - static_cast<int>(prev[b]));
+            sum += IAbs(static_cast<int>(cur[a + 1]) - static_cast<int>(prev[b + 1]));
+            sum += IAbs(static_cast<int>(cur[a + 2]) - static_cast<int>(prev[b + 2]));
+            n += 3;
+        }
+    }
+    return n > 0 ? static_cast<double>(sum) / static_cast<double>(n) : -1.0;
+}
+
 static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
-                      bool flip_motion, bool no_tonemap, int max_frames)
+                      bool flip_motion, bool no_tonemap, bool no_mv_stride, int max_frames)
 {
     std::string root = (cap_dir != nullptr) ? cap_dir : "";
     while (!root.empty() && (root.back() == '\\' || root.back() == '/')) root.pop_back();
@@ -3376,8 +3429,6 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
 
     // On-disk formats. The capture layer may compact (motion -> RG16F, colour -> R11G11B10F);
     // follow frame.json rather than assuming, so old (uncompacted) and new sessions both read.
-    // On-disk formats. The capture layer may compact (motion -> RG16F, colour -> R11G11B10F);
-    // follow frame.json rather than assuming, so old (uncompacted) and new sessions both read.
     // Only the four formats below are decodable here. Anything else means the capture layer
     // wrote a raw source format this build cannot interpret: fail fast with the format name
     // instead of quietly misreading the bytes (a wrong stride that still passes the size check
@@ -3388,16 +3439,17 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     if (colorFmt.empty())  colorFmt  = "DXGI_FORMAT_R16G16B16A16_FLOAT";
     if (motionFmt.empty()) motionFmt = "DXGI_FORMAT_R16G16B16A16_FLOAT";
 
+    const bool colorRGB8    = (colorFmt  == "R8G8B8_UNORM"); // 3 B/px, tone map baked at capture
     const bool colorRGBA16  = (colorFmt  == "DXGI_FORMAT_R16G16B16A16_FLOAT");
     const bool colorR11     = (colorFmt  == "DXGI_FORMAT_R11G11B10_FLOAT");
     const bool motionRGBA16 = (motionFmt == "DXGI_FORMAT_R16G16B16A16_FLOAT");
     const bool motionRG16   = (motionFmt == "DXGI_FORMAT_R16G16_FLOAT");
 
-    if (!colorRGBA16 && !colorR11)
+    if (!colorRGB8 && !colorRGBA16 && !colorR11)
     {
         Log("[host] --capture: unsupported on-disk colour format %s (this build decodes "
-            "R16G16B16A16_FLOAT and R11G11B10_FLOAT only). Re-capture with [Capture] Compact=true, "
-            "or use a host built for this format.", colorFmt.c_str());
+            "R8G8B8_UNORM, R16G16B16A16_FLOAT and R11G11B10_FLOAT). Re-capture with "
+            "[Capture] Compact=true, or use a host built for this format.", colorFmt.c_str());
         return 1;
     }
     if (!motionRGBA16 && !motionRG16)
@@ -3407,7 +3459,7 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         return 1;
     }
 
-    const size_t colorBpp  = colorR11   ? 4u : 8u;
+    const size_t colorBpp  = colorRGB8 ? 3u : (colorR11 ? 4u : 8u);
     const size_t motionBpp = motionRG16 ? 4u : 8u;
 
     const UINT RW = static_cast<UINT>(rw), RH = static_cast<UINT>(rh);
@@ -3419,6 +3471,37 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     if (depth_inv) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (auto_exp)  flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
 
+    // ---- motion-vector time base -------------------------------------------------
+    // The model reprojects its temporal history between the frames it is FED. A strided capture
+    // feeds every `stride`-th game frame, but each captured MV describes only ONE game frame, so
+    // the reprojection is short by that factor and the history smears. Scaling the MV by the
+    // stride (through InMVScale) makes the two agree again. stride=1 -> no change.
+    int capStride = 1;
+    {
+        std::string mpath = root + "\\manifest.json";
+        bool mok = false;
+        std::string mf = ReadFileAll(mpath.c_str(), &mok);
+        double sv = 1.0;
+        if (mok && JsonNum(mf.c_str(), "frame_stride", &sv) && sv >= 1.0)
+            capStride = static_cast<int>(sv + 0.5);
+    }
+    if (capStride < 1)
+        capStride = 1;
+    if (capStride > 1)
+    {
+        if (no_mv_stride)
+            Log("[host] --capture: frame_stride=%d but --no-mv-stride is set: feeding the raw MV, so the "
+                "temporal reprojection is short by %dx", capStride, capStride);
+        else
+        {
+            msx *= capStride;
+            msy *= capStride;
+            Log("[host] --capture: frame_stride=%d -> motion scale x%d (each MV covers one game frame, the "
+                "model is fed every %d-th) so temporal reprojection lines up; disable with --no-mv-stride",
+                capStride, capStride, capStride);
+        }
+    }
+
     Log("[host] --capture: %s -> %s", root.c_str(), outd.c_str());
     Log("[host] --capture: render %ux%u -> target %ux%u, motion scale (%.4f, %.4f) "
         "hdr=%d low_res_mv=%d depth_inverted=%d auto_exposure=%d flags=0x%X",
@@ -3426,7 +3509,10 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     Log("[host] --capture: on-disk colour %s (%u B/px), motion %s (%u B/px)",
         colorFmt.c_str(), static_cast<unsigned>(colorBpp),
         motionFmt.c_str(), static_cast<unsigned>(motionBpp));
-    if (is_hdr && !no_tonemap)
+    if (colorRGB8)
+        Log("[host] --capture: colour is pre-baked 8-bit RGB (Reinhard + gamma applied at capture); "
+            "--no-tone-map has nothing left to do");
+    else if (is_hdr && !no_tonemap)
         Log("[host] --capture: HDR source; colour is Reinhard tone-mapped to SDR RGBA8 on the CPU");
 
     // ---- textures: exactly the formats --test proved on this device ----
@@ -3483,16 +3569,39 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     if (!CreateFeature(RW, RH, flags, &rf, TW, TH))
     { Log("[host] --capture: CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf)); return 1; }
 
-    // The session captured no depth (CaptureDepth=false) and the model still wants
-    // one, so feed a constant plane: the answer is about colour and motion here.
-    if (!CapUpload(depth, up, upm, upPitch, depthPlane.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R32_FLOAT))
-    { Log("[host] --capture: depth upload failed"); return 1; }
-    Log("[host] --capture: depth is a constant plane (the session captured none)");
+    // Depth: use the session's real depth.bin when it is a 32-bit float plane (which is what
+    // this host's depth texture is); otherwise feed a constant plane and say why. Only D32/R32
+    // is accepted -- a 16-bit or packed depth would be silently misread otherwise.
+    bool hasDepth = false;
+    std::string depthFmt;
+    JsonStr(fj.c_str(), "depth_format", &depthFmt);
+    if (depthFmt == "DXGI_FORMAT_R32_FLOAT" || depthFmt == "DXGI_FORMAT_D32_FLOAT" ||
+        depthFmt == "DXGI_FORMAT_R32_TYPELESS")
+    {
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d\\depth.bin", root.c_str(), 0);
+        bool dok = false;
+        std::string dprobe = ReadFileAll(path, &dok);
+        hasDepth = dok && dprobe.size() >= static_cast<size_t>(RW) * RH * 4u;
+    }
+    if (hasDepth)
+        Log("[host] --capture: depth = real (depth.bin, %s)", depthFmt.c_str());
+    else if (!depthFmt.empty())
+        Log("[host] --capture: depth = constant plane (session depth is '%s', not a 32-bit float plane)",
+            depthFmt.c_str());
+    else
+        Log("[host] --capture: depth = constant plane (the session captured none)");
 
     const float   *hl = HalfLut();
     const uint8_t *gl = GammaLut();
 
     int written = 0;
+    int noTimeCount = 0;                // frame_time_ms 缺失（NGX 没给）的帧数
+    std::vector<double> ftMs, engIdx;   // 每个已写出帧的游戏帧时长(ms)与引擎帧序号
+
+    // 运动方向探测（结论在循环后打印）：+MV 与 -MV 哪个更能把上一帧对齐到当前帧
+    std::vector<uint8_t> prevColor;
+    double dirPlus = 0.0, dirMinus = 0.0;
+    long dirN = 0;
     for (int i = 0; i < max_frames; ++i)
     {
         sprintf_s(path, sizeof(path), "%s\\frame_%06d\\frame.json", root.c_str(), i);
@@ -3505,6 +3614,9 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         JsonNum(fjf.c_str(), "jitter_y", &jy);
         JsonNum(fjf.c_str(), "motion_scale_x", &fmx);
         JsonNum(fjf.c_str(), "motion_scale_y", &fmy);
+        double frameTimeMs = 0.0, engineFrame = -1.0;
+        JsonNum(fjf.c_str(), "frame_time_ms", &frameTimeMs);
+        JsonNum(fjf.c_str(), "engine_frame_count", &engineFrame);
 
         sprintf_s(path, sizeof(path), "%s\\frame_%06d\\color.bin", root.c_str(), i);
         std::string cbin = ReadFileAll(path, &fok);
@@ -3516,9 +3628,23 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         if (!fok || mbin.size() < static_cast<size_t>(RW) * RH * motionBpp)
         { Log("[host] --capture: frame %d has no usable motion.bin", i); break; }
 
-        // colour: on-disk HDR -> RGBA8 SDR (Reinhard unless --no-tone-map)
+        // colour: on-disk -> the RGBA8 the model is fed
         const size_t npix = static_cast<size_t>(RW) * RH;
-        if (colorR11)
+        if (colorRGB8)
+        {
+            // The capture layer already applied Reinhard + gamma when it wrote 8-bit RGB, so
+            // this is a straight expand; alpha is the constant 0xFF the other branches produce.
+            const uint8_t *cs = reinterpret_cast<const uint8_t *>(cbin.data());
+            for (size_t p = 0; p < npix; ++p)
+            {
+                uint8_t *o = &colorRGBA8[p * 4];
+                o[0] = cs[p * 3 + 0];
+                o[1] = cs[p * 3 + 1];
+                o[2] = cs[p * 3 + 2];
+                o[3] = 0xFF;
+            }
+        }
+        else if (colorR11)
         {
             const uint32_t *cs = reinterpret_cast<const uint32_t *>(cbin.data());
             for (size_t p = 0; p < npix; ++p)
@@ -3576,7 +3702,51 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
             }
         }
 
-        if (!CapUpload(color, up, upm, upPitch, colorRGBA8.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R8G8B8A8_UNORM) ||
+        // ---- motion-direction probe: does +MV or -MV align the previous frame to this one? ----
+        if (!prevColor.empty())
+        {
+            double ax = 0.0, ay = 0.0;
+            long ac = 0;
+            for (size_t p = 0; p < npix; p += 7)
+            {
+                ax += hl[motionRG[p * 2 + 0]];
+                ay += hl[motionRG[p * 2 + 1]];
+                ++ac;
+            }
+            if (ac > 0)
+            {
+                const double mxx = ax / static_cast<double>(ac);
+                const double myy = ay / static_cast<double>(ac);
+                const int dx = static_cast<int>(mxx + (mxx >= 0.0 ? 0.5 : -0.5));
+                const int dy = static_cast<int>(myy + (myy >= 0.0 ? 0.5 : -0.5));
+                if ((IAbs(dx) + IAbs(dy)) >= 2 && IAbs(dx) <= 64 && IAbs(dy) <= 64)
+                {
+                    const double mp = MadShifted(colorRGBA8, prevColor, RW, RH, dx, dy);
+                    const double mm = MadShifted(colorRGBA8, prevColor, RW, RH, -dx, -dy);
+                    if (mp >= 0.0 && mm >= 0.0)
+                    {
+                        dirPlus += mp;
+                        dirMinus += mm;
+                        ++dirN;
+                    }
+                }
+            }
+        }
+
+        // depth: the real per-frame plane when the session has it, else the constant one
+        std::string dbin;
+        const void *depthSrc = depthPlane.data();
+        if (hasDepth)
+        {
+            sprintf_s(path, sizeof(path), "%s\\frame_%06d\\depth.bin", root.c_str(), i);
+            bool dok = false;
+            dbin = ReadFileAll(path, &dok);
+            if (!dok || dbin.size() < static_cast<size_t>(RW) * RH * 4u)
+            { Log("[host] --capture: frame %d has no usable depth.bin", i); break; }
+            depthSrc = dbin.data();
+        }
+        if (!CapUpload(depth, up, upm, upPitch, depthSrc, RW, RH, RW * 4u, 4u, DXGI_FORMAT_R32_FLOAT) ||
+            !CapUpload(color, up, upm, upPitch, colorRGBA8.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R8G8B8A8_UNORM) ||
             !CapUpload(mv, up, upm, upPitch, motionRG.data(), RW, RH, RW * 4u, 4u, DXGI_FORMAT_R16G16_FLOAT))
         { Log("[host] --capture: frame %d upload failed", i); break; }
 
@@ -3590,15 +3760,72 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
         if (!CapReadback(output, rb, rbPitch, TW, TH, DXGI_FORMAT_R8G8B8A8_UNORM, &outp))
         { Log("[host] --capture: frame %d readback failed", i); break; }
 
-        sprintf_s(path, sizeof(path), "%s\\frame_%06d.bmp", outd.c_str(), i);
-        if (!WriteBMP24(path, outp, TW, TH, rbPitch))
+        sprintf_s(path, sizeof(path), "%s\\frame_%06d.png", outd.c_str(), i);
+        if (!WritePNG24(path, outp, TW, TH, rbPitch))
         { Log("[host] --capture: cannot write %s", path); D3D12_RANGE none = { 0, 0 }; rb->Unmap(0, &none); break; }
         D3D12_RANGE none = { 0, 0 };
         rb->Unmap(0, &none);
 
         ++written;
+        ftMs.push_back(frameTimeMs);
+        engIdx.push_back(engineFrame);
+        if (!(frameTimeMs > 0.0))
+            ++noTimeCount;
         if (written == 1 || (written % 10) == 0)
             Log("[host] --capture: %d frame(s) written (%ux%u)", written, TW, TH);
+
+        prevColor.swap(colorRGBA8);   // this frame becomes the probe's "previous"
+    }
+
+    // ---- motion-direction verdict ----
+    if (dirN > 0)
+        Log("[host] --capture: motion-direction probe (%ld pair(s)): prev(x+MV) MAD=%.2f vs prev(x-MV) "
+            "MAD=%.2f -> %s", dirN, dirPlus / static_cast<double>(dirN), dirMinus / static_cast<double>(dirN),
+            (dirMinus < dirPlus) ? "the FLIPPED sign aligns better; add --flip-motion if the output ghosts"
+                                 : "the as-captured sign aligns better; --flip-motion is NOT needed");
+    else
+        Log("[host] --capture: motion-direction probe: no usable global motion (the camera barely moved), "
+            "so it cannot tell; only add --flip-motion if the output actually ghosts");
+
+    // ---- frames.txt: 每帧的真实显示时长 ------------------------------------------
+    // 捕获帧率是动态的（游戏帧率 ÷ stride，还可能丢帧），单一 -framerate 会把它当恒定值。
+    // frame.json 每帧都带 frame_time_ms（游戏帧时长）和 engine_frame_count（游戏帧序号）：
+    // 相邻两帧的序号差 × 帧时长 = 这两帧之间的真实时间，stride 和丢帧都被自动算进去。
+    // 写成 concat 列表后，ffmpeg 就能按真实时间轴合成，变速问题消失。
+    std::vector<double> durs(ftMs.size(), 0.0);
+    double totalSec = 0.0;
+    for (size_t k = 0; k < ftMs.size(); ++k)
+    {
+        double d = 0.0;
+        if (k + 1 < ftMs.size() && engIdx[k + 1] > engIdx[k] && ftMs[k] > 0.0)
+            d = (engIdx[k + 1] - engIdx[k]) * ftMs[k] / 1000.0;
+        else if (k > 0)
+            d = durs[k - 1];   // 末帧沿用前一帧的时长
+        else
+            d = (ftMs[k] > 0.0) ? (ftMs[k] / 1000.0) : (1.0 / 30.0);
+        durs[k] = d;
+        totalSec += d;
+    }
+    const double captureFps = totalSec > 0.0 ? static_cast<double>(durs.size()) / totalSec : 0.0;
+
+    if (!durs.empty())
+    {
+        sprintf_s(path, sizeof(path), "%s\\frames.txt", outd.c_str());
+        FILE *lf = nullptr;
+        if (fopen_s(&lf, path, "w") == 0 && lf != nullptr)
+        {
+            for (size_t k = 0; k < durs.size(); ++k)
+                fprintf(lf, "file 'frame_%06d.png'\nduration %.6f\n", static_cast<int>(k), durs[k]);
+            // concat 解复用器会忽略最后一条 duration，重复最后一个文件来补上
+            fprintf(lf, "file 'frame_%06d.png'\n", static_cast<int>(durs.size() - 1));
+            fclose(lf);
+            Log("[host] --capture: wrote frames.txt (%d frames, %.2f s real time -> avg %.1f capture fps)",
+                static_cast<int>(durs.size()), totalSec, captureFps);
+            if (noTimeCount > 0)
+                Log("[host] --capture: WARNING %d/%d frames had no frame_time_ms (NGX did not supply it); "
+                    "their durations fall back to the previous frame, so timing may drift",
+                    noTimeCount, static_cast<int>(durs.size()));
+        }
     }
 
     // result.json: the rate lives next to the frames so ffmpeg needs no memory of it
@@ -3608,16 +3835,46 @@ static int RunCapture(const char *cap_dir, const char *out_dir, int fps,
     {
         fprintf(rfj,
                 "{\n  \"frames\": %d,\n  \"fps\": %d,\n  \"width\": %u,\n  \"height\": %u,\n"
+                "  \"duration_sec\": %.3f,\n  \"capture_fps\": %.2f,\n"
                 "  \"source\": \"%s\",\n  \"depth\": \"constant plane (none captured)\",\n"
                 "  \"flip_motion\": %s\n}\n",
-                written, fps, TW, TH, root.c_str(), flip_motion ? "true" : "false");
+                written, fps, TW, TH, totalSec, captureFps, root.c_str(), flip_motion ? "true" : "false");
         fclose(rfj);
     }
 
+    // The capture layer records the system/game audio into the session dir (audio.wav); bring it
+    // along so the ffmpeg command below can mux it without the user hunting for the session path.
+    bool haveAudio = false;
+    {
+        sprintf_s(path, sizeof(path), "%s\\audio.wav", root.c_str());
+        FILE *asrc = nullptr;
+        if (fopen_s(&asrc, path, "rb") == 0 && asrc != nullptr)
+        {
+            sprintf_s(path, sizeof(path), "%s\\audio.wav", outd.c_str());
+            FILE *adst = nullptr;
+            if (fopen_s(&adst, path, "wb") == 0 && adst != nullptr)
+            {
+                char abuf[64 * 1024];
+                size_t an = 0;
+                while ((an = fread(abuf, 1, sizeof(abuf), asrc)) > 0)
+                    fwrite(abuf, 1, an, adst);
+                fclose(adst);
+                haveAudio = true;
+            }
+            fclose(asrc);
+        }
+    }
+
     Log("[host] --capture finished: %d frame(s) -> %s", written, outd.c_str());
+    if (haveAudio)
+        Log("[host] --capture: copied audio.wav (system audio from the capture layer)");
     if (written > 0)
-        Log("[host] --capture: ffmpeg -framerate %d -i frame_%%06d.bmp -c:v libx264 -crf 16 "
-            "-pix_fmt yuv420p dlss5_out.mp4", fps);
+    {
+        Log("[host] --capture: exact-timing composite (frames.txt carries each frame's real duration):");
+        Log("[host]   ffmpeg -f concat -safe 0 -i frames.txt%s -c:v libx264 -crf 16 -pix_fmt yuv420p%s dlss5_out.mp4",
+            haveAudio ? " -i audio.wav" : "", haveAudio ? " -c:a aac -b:a 192k -shortest" : "");
+        Log("[host]   (constant-rate fallback, no frames.txt: ffmpeg -framerate %d -i frame_%%06d.png ...)", fps);
+    }
 
     up->Unmap(0, nullptr);
     up->Release();
@@ -4635,7 +4892,7 @@ int main(int argc, char **argv)
     // --capture: replay a captured session from disk instead of serving a game.
     const char *cap_dir = nullptr, *cap_out = nullptr;
     int  cap_fps = 30, cap_max = 0;
-    bool cap_flip = false, cap_notm = false;
+    bool cap_flip = false, cap_notm = false, cap_no_mv_stride = false;
     DWORD pid = 0;
     for (int i = 1; i < argc; ++i)
     {
@@ -4649,6 +4906,7 @@ int main(int argc, char **argv)
         else if (strcmp(argv[i], "--max-frames") == 0 && i + 1 < argc) cap_max = atoi(argv[++i]);
         else if (strcmp(argv[i], "--flip-motion") == 0) cap_flip = true;
         else if (strcmp(argv[i], "--no-tone-map") == 0) cap_notm = true;
+        else if (strcmp(argv[i], "--no-mv-stride") == 0) cap_no_mv_stride = true;
         // First numeric token wins. This used to be a bare assignment, so ANY later token
         // the parser did not recognise ran through strtoul, came back 0, and silently
         // overwrote an already-parsed pid -- turning a good command line into the usage
@@ -4661,7 +4919,7 @@ int main(int argc, char **argv)
         Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide | --behind] "
             "[--gpu-priority]");
         Log("       dlss5-feed-host64 --capture <session dir> --out <dir> [--fps N] [--max-frames N] "
-            "[--flip-motion] [--no-tone-map]");
+            "[--flip-motion] [--no-tone-map] [--no-mv-stride]");
         return 1;
     }
     // --capture is headless like --test: nothing to watch, the frames land on disk.
@@ -4699,7 +4957,7 @@ int main(int argc, char **argv)
     else
         rc = test ? RunTest()
                   : (cap_dir != nullptr
-                         ? RunCapture(cap_dir, cap_out, cap_fps, cap_flip, cap_notm,
+                         ? RunCapture(cap_dir, cap_out, cap_fps, cap_flip, cap_notm, cap_no_mv_stride,
                                       cap_max > 0 ? cap_max : (1 << 30))
                          : Serve(pid));
 
